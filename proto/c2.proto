@@ -1,11 +1,12 @@
 syntax = "proto3";
 
-package shadownet;
+package c2grpc;
 
 option go_package = "github.com/ardhptr21/c2-grpc/pb";
 
 service AgentService {
   rpc Register(RegisterRequest) returns (RegisterResponse);
+  rpc Unregister(UnregisterRequest) returns (UnregisterResponse);
 }
 
 service HeartbeatService {
@@ -32,6 +33,15 @@ message RegisterRequest {
 
 message RegisterResponse {
   string agent_id = 1;
+  string message = 2;
+}
+
+message UnregisterRequest {
+  string agent_id = 1;
+}
+
+message UnregisterResponse {
+  bool success = 1;
   string message = 2;
 }
 

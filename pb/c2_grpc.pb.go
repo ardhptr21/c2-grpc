@@ -19,7 +19,8 @@ import (
 const _ = grpc.SupportPackageIsVersion8
 
 const (
-	AgentService_Register_FullMethodName = "/shadownet.AgentService/Register"
+	AgentService_Register_FullMethodName   = "/c2grpc.AgentService/Register"
+	AgentService_Unregister_FullMethodName = "/c2grpc.AgentService/Unregister"
 )
 
 // AgentServiceClient is the client API for AgentService service.
@@ -27,6 +28,7 @@ const (
 // For semantics around ctx use and closing/ending streaming RPCs, please refer to https://pkg.go.dev/google.golang.org/grpc/?tab=doc#ClientConn.NewStream.
 type AgentServiceClient interface {
 	Register(ctx context.Context, in *RegisterRequest, opts ...grpc.CallOption) (*RegisterResponse, error)
+	Unregister(ctx context.Context, in *UnregisterRequest, opts ...grpc.CallOption) (*UnregisterResponse, error)
 }
 
 type agentServiceClient struct {
@@ -47,11 +49,22 @@ func (c *agentServiceClient) Register(ctx context.Context, in *RegisterRequest, 
 	return out, nil
 }
 
+func (c *agentServiceClient) Unregister(ctx context.Context, in *UnregisterRequest, opts ...grpc.CallOption) (*UnregisterResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(UnregisterResponse)
+	err := c.cc.Invoke(ctx, AgentService_Unregister_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // AgentServiceServer is the server API for AgentService service.
 // All implementations must embed UnimplementedAgentServiceServer
 // for forward compatibility
 type AgentServiceServer interface {
 	Register(context.Context, *RegisterRequest) (*RegisterResponse, error)
+	Unregister(context.Context, *UnregisterRequest) (*UnregisterResponse, error)
 	mustEmbedUnimplementedAgentServiceServer()
 }
 
@@ -61,6 +74,9 @@ type UnimplementedAgentServiceServer struct {
 
 func (UnimplementedAgentServiceServer) Register(context.Context, *RegisterRequest) (*RegisterResponse, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method Register not implemented")
+}
+func (UnimplementedAgentServiceServer) Unregister(context.Context, *UnregisterRequest) (*UnregisterResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method Unregister not implemented")
 }
 func (UnimplementedAgentServiceServer) mustEmbedUnimplementedAgentServiceServer() {}
 
@@ -93,16 +109,38 @@ func _AgentService_Register_Handler(srv interface{}, ctx context.Context, dec fu
 	return interceptor(ctx, in, info, handler)
 }
 
+func _AgentService_Unregister_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(UnregisterRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(AgentServiceServer).Unregister(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: AgentService_Unregister_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(AgentServiceServer).Unregister(ctx, req.(*UnregisterRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 // AgentService_ServiceDesc is the grpc.ServiceDesc for AgentService service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
 var AgentService_ServiceDesc = grpc.ServiceDesc{
-	ServiceName: "shadownet.AgentService",
+	ServiceName: "c2grpc.AgentService",
 	HandlerType: (*AgentServiceServer)(nil),
 	Methods: []grpc.MethodDesc{
 		{
 			MethodName: "Register",
 			Handler:    _AgentService_Register_Handler,
+		},
+		{
+			MethodName: "Unregister",
+			Handler:    _AgentService_Unregister_Handler,
 		},
 	},
 	Streams:  []grpc.StreamDesc{},
@@ -110,7 +148,7 @@ var AgentService_ServiceDesc = grpc.ServiceDesc{
 }
 
 const (
-	HeartbeatService_SendHeartbeat_FullMethodName = "/shadownet.HeartbeatService/SendHeartbeat"
+	HeartbeatService_SendHeartbeat_FullMethodName = "/c2grpc.HeartbeatService/SendHeartbeat"
 )
 
 // HeartbeatServiceClient is the client API for HeartbeatService service.
@@ -221,7 +259,7 @@ func (x *heartbeatServiceSendHeartbeatServer) Recv() (*HeartbeatRequest, error) 
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
 var HeartbeatService_ServiceDesc = grpc.ServiceDesc{
-	ServiceName: "shadownet.HeartbeatService",
+	ServiceName: "c2grpc.HeartbeatService",
 	HandlerType: (*HeartbeatServiceServer)(nil),
 	Methods:     []grpc.MethodDesc{},
 	Streams: []grpc.StreamDesc{
@@ -235,7 +273,7 @@ var HeartbeatService_ServiceDesc = grpc.ServiceDesc{
 }
 
 const (
-	TaskService_ReceiveTasks_FullMethodName = "/shadownet.TaskService/ReceiveTasks"
+	TaskService_ReceiveTasks_FullMethodName = "/c2grpc.TaskService/ReceiveTasks"
 )
 
 // TaskServiceClient is the client API for TaskService service.
@@ -339,7 +377,7 @@ func (x *taskServiceReceiveTasksServer) Send(m *Task) error {
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
 var TaskService_ServiceDesc = grpc.ServiceDesc{
-	ServiceName: "shadownet.TaskService",
+	ServiceName: "c2grpc.TaskService",
 	HandlerType: (*TaskServiceServer)(nil),
 	Methods:     []grpc.MethodDesc{},
 	Streams: []grpc.StreamDesc{
@@ -353,7 +391,7 @@ var TaskService_ServiceDesc = grpc.ServiceDesc{
 }
 
 const (
-	OutputService_SendOutput_FullMethodName = "/shadownet.OutputService/SendOutput"
+	OutputService_SendOutput_FullMethodName = "/c2grpc.OutputService/SendOutput"
 )
 
 // OutputServiceClient is the client API for OutputService service.
@@ -464,7 +502,7 @@ func (x *outputServiceSendOutputServer) Recv() (*OutputChunk, error) {
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
 var OutputService_ServiceDesc = grpc.ServiceDesc{
-	ServiceName: "shadownet.OutputService",
+	ServiceName: "c2grpc.OutputService",
 	HandlerType: (*OutputServiceServer)(nil),
 	Methods:     []grpc.MethodDesc{},
 	Streams: []grpc.StreamDesc{
@@ -478,7 +516,7 @@ var OutputService_ServiceDesc = grpc.ServiceDesc{
 }
 
 const (
-	OperatorService_Connect_FullMethodName = "/shadownet.OperatorService/Connect"
+	OperatorService_Connect_FullMethodName = "/c2grpc.OperatorService/Connect"
 )
 
 // OperatorServiceClient is the client API for OperatorService service.
@@ -586,7 +624,7 @@ func (x *operatorServiceConnectServer) Recv() (*OperatorCommand, error) {
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
 var OperatorService_ServiceDesc = grpc.ServiceDesc{
-	ServiceName: "shadownet.OperatorService",
+	ServiceName: "c2grpc.OperatorService",
 	HandlerType: (*OperatorServiceServer)(nil),
 	Methods:     []grpc.MethodDesc{},
 	Streams: []grpc.StreamDesc{

