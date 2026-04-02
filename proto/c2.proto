@@ -1,0 +1,80 @@
+syntax = "proto3";
+
+package shadownet;
+
+option go_package = "github.com/ardhptr21/c2-grpc/pb";
+
+service AgentService {
+  rpc Register(RegisterRequest) returns (RegisterResponse);
+}
+
+service HeartbeatService {
+  rpc SendHeartbeat(stream HeartbeatRequest) returns (HeartbeatSummary);
+}
+
+service TaskService {
+  rpc ReceiveTasks(TaskRequest) returns (stream Task);
+}
+
+service OutputService {
+  rpc SendOutput(stream OutputChunk) returns (OutputAck);
+}
+
+service OperatorService {
+  rpc Connect(stream OperatorCommand) returns (stream OperatorEvent);
+}
+
+message RegisterRequest {
+  string hostname = 1;
+  string os = 2;
+  string ip = 3;
+}
+
+message RegisterResponse {
+  string agent_id = 1;
+  string message = 2;
+}
+
+message HeartbeatRequest {
+  string agent_id = 1;
+  string status = 2;
+  int64 timestamp = 3;
+}
+
+message HeartbeatSummary {
+  int32 total_received = 1;
+  string last_status = 2;
+}
+
+message TaskRequest {
+  string agent_id = 1;
+}
+
+message Task {
+  string task_id = 1;
+  string command = 2;
+  string args = 3;
+}
+
+message OutputChunk {
+  string task_id = 1;
+  string agent_id = 2;
+  string line = 3;
+}
+
+message OutputAck {
+  string task_id = 1;
+  bool success = 2;
+}
+
+message OperatorCommand {
+  string target_agent_id = 1;
+  string command = 2;
+  string args = 3;
+}
+
+message OperatorEvent {
+  string type = 1;
+  string agent_id = 2;
+  string payload = 3;
+}
