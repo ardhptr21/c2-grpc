@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
-	"io"
 	"log"
 	"sort"
 	"strings"
@@ -35,6 +34,7 @@ type operatorEventMsg struct {
 type operatorConnectedMsg struct {
 	stream        pb.OperatorService_ConnectClient
 	historyClient pb.HistoryServiceClient
+	shellStream   pb.ShellService_OperatorShellClient
 }
 
 type operatorDisconnectedMsg struct {
@@ -50,14 +50,20 @@ type historyErrorMsg struct {
 	message string
 }
 
+type shellEventMsg struct {
+	event *pb.AgentShellEvent
+}
+
 type operatorModel struct {
 	stream                pb.OperatorService_ConnectClient
 	historyClient         pb.HistoryServiceClient
+	shellStream           pb.ShellService_OperatorShellClient
 	events                chan tea.Msg
 	commandInput          textinput.Model
 	logViewport           viewport.Model
 	historyListViewport   viewport.Model
 	historyDetailViewport viewport.Model
+	shellViewport         viewport.Model
 	screen                string
 	activeTab             string
 	logContent            string
@@ -68,6 +74,11 @@ type operatorModel struct {
 	historyEntries        []*pb.AgentHistoryEntry
 	historySelected       int
 	historyAgentID        string
+	shellSessionID        string
+	shellAgentID          string
+	shellOutput           string
+	shellReady            bool
+	shellInputBuffer      string
 	width                 int
 	height                int
 	status                string
@@ -118,6 +129,7 @@ func newOperatorModel() operatorModel {
 	vp.SetContent("Waiting for operator events...")
 	historyList := viewport.New(40, 20)
 	historyDetail := viewport.New(80, 20)
+	shellView := viewport.New(80, 20)
 
 	return operatorModel{
 		events:                make(chan tea.Msg, 64),
@@ -125,6 +137,7 @@ func newOperatorModel() operatorModel {
 		logViewport:           vp,
 		historyListViewport:   historyList,
 		historyDetailViewport: historyDetail,
+		shellViewport:         shellView,
 		screen:                "landing",
 		activeTab:             "live",
 		agents:                make(map[string]agentRow),
@@ -161,11 +174,13 @@ func (m operatorModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case operatorConnectedMsg:
 		m.stream = msg.stream
 		m.historyClient = msg.historyClient
+		m.shellStream = msg.shellStream
 		m.status = "Connected. Use ↑/↓ to pick an agent and Enter to dispatch."
 		return m, waitForOperatorEvent(m.events)
 	case operatorDisconnectedMsg:
 		m.stream = nil
 		m.historyClient = nil
+		m.shellStream = nil
 		m.agents = make(map[string]agentRow)
 		m.agentOrder = nil
 		m.selected = 0
@@ -173,6 +188,11 @@ func (m operatorModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.historySelected = 0
 		m.historyAgentID = ""
 		m.historyCache = make(map[string][]*pb.AgentHistoryEntry)
+		m.shellSessionID = ""
+		m.shellAgentID = ""
+		m.shellOutput = ""
+		m.shellReady = false
+		m.shellInputBuffer = ""
 		m.activeTab = "live"
 		if msg.message != "" {
 			m.status = msg.message
@@ -196,11 +216,17 @@ func (m operatorModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case historyErrorMsg:
 		m.status = msg.message
 		return m, nil
+	case shellEventMsg:
+		m.applyShellEvent(msg.event)
+		return m, waitForOperatorEvent(m.events)
 	case tea.KeyMsg:
 		switch msg.String() {
 		case "ctrl+c", "q":
 			if m.stream != nil {
 				_ = m.stream.CloseSend()
+			}
+			if m.shellStream != nil {
+				_ = m.shellStream.CloseSend()
 			}
 			return m, tea.Quit
 		case "enter":
@@ -208,6 +234,19 @@ func (m operatorModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.screen = "operator"
 				return m, nil
 			}
+		case "f1":
+			m.activeTab = "live"
+			return m, nil
+		case "f2":
+			if cmd := m.activateHistoryTab(); cmd != nil {
+				return m, cmd
+			}
+			return m, nil
+		case "f3":
+			if cmd := m.activateShellTab(); cmd != nil {
+				return m, cmd
+			}
+			return m, nil
 		}
 
 		if m.screen == "landing" {
@@ -220,12 +259,25 @@ func (m operatorModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				if cmd := m.activateHistoryTab(); cmd != nil {
 					return m, cmd
 				}
+			} else if m.activeTab == "history" {
+				if cmd := m.activateShellTab(); cmd != nil {
+					return m, cmd
+				}
+			} else {
+				break
 			}
 			return m, nil
 		case "shift+tab":
 			if m.activeTab == "history" {
 				m.activeTab = "live"
+			} else if m.activeTab == "shell" {
+				break
 			}
+			return m, nil
+		}
+
+		if m.activeTab == "shell" {
+			m.handleShellKey(msg)
 			return m, nil
 		}
 
@@ -261,10 +313,10 @@ func (m operatorModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			case "ctrl+d":
 				m.historyDetailViewport.LineDown(10)
 				return m, nil
-			case "pgup", "b":
+			case "pgup":
 				m.historyDetailViewport.HalfViewUp()
 				return m, nil
-			case "pgdown", "f":
+			case "pgdown":
 				m.historyDetailViewport.HalfViewDown()
 				return m, nil
 			case "home":
@@ -278,10 +330,10 @@ func (m operatorModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 
 		switch msg.String() {
-		case "pgup", "b":
+		case "pgup":
 			m.logViewport.HalfViewUp()
 			return m, nil
-		case "pgdown", "f":
+		case "pgdown":
 			m.logViewport.HalfViewDown()
 			return m, nil
 		case "home":
@@ -367,6 +419,16 @@ func (m operatorModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m, nil
 			}
 		}
+		if m.activeTab == "shell" && msg.Action == tea.MouseActionPress {
+			switch msg.Button {
+			case tea.MouseButtonWheelUp:
+				m.shellViewport.LineUp(3)
+				return m, nil
+			case tea.MouseButtonWheelDown:
+				m.shellViewport.LineDown(3)
+				return m, nil
+			}
+		}
 		return m, nil
 	}
 
@@ -386,6 +448,9 @@ func (m operatorModel) View() string {
 
 	if m.activeTab == "history" {
 		return m.renderHistory()
+	}
+	if m.activeTab == "shell" {
+		return m.renderShell()
 	}
 
 	dims := m.layout()
@@ -432,6 +497,27 @@ func (m operatorModel) renderHistory() string {
 		lipgloss.Left,
 		header,
 		lipgloss.JoinHorizontal(lipgloss.Top, listPane, detailPane),
+		footer,
+	))
+	return lipgloss.Place(m.width, m.height, lipgloss.Left, lipgloss.Top, content)
+}
+
+func (m operatorModel) renderShell() string {
+	dims := m.layout()
+	header := m.renderTabbedHeader("Persistent interactive shell session for the selected agent.")
+	agentsPane := panelStyle.Width(dims.leftPaneWidth).Height(dims.paneContentHeight).Render(m.renderAgents())
+	shellPane := panelStyle.Width(dims.rightPaneWidth).Height(dims.paneContentHeight).Render(m.shellViewport.View())
+	footer := panelStyle.Width(dims.availableWidth).Render(
+		"Shell Agent: " + shortAgentID(m.shellAgentID) + "\n" +
+			"Input: " + m.renderShellInputIndicator() + "\n" +
+			mutedStyle.Render("Type directly into the shell. F1 Live, F2 History, F3 Shell. Mouse wheel, PgUp/PgDn, Home/End scroll viewport.") + "\n" +
+			m.status,
+	)
+
+	content := appStyle.Render(lipgloss.JoinVertical(
+		lipgloss.Left,
+		header,
+		lipgloss.JoinHorizontal(lipgloss.Top, agentsPane, shellPane),
 		footer,
 	))
 	return lipgloss.Place(m.width, m.height, lipgloss.Left, lipgloss.Top, content)
@@ -502,7 +588,11 @@ func (m *operatorModel) resize() {
 	m.historyListViewport.Height = dims.paneContentHeight
 	m.historyDetailViewport.Width = dims.logViewportWidth
 	m.historyDetailViewport.Height = dims.logViewportHeight
+	m.shellViewport.Width = dims.logViewportWidth
+	m.shellViewport.Height = dims.logViewportHeight
 	m.refreshHistoryViewports()
+	m.refreshShellViewport()
+	m.resizeShell()
 }
 
 func (m operatorModel) layout() layoutDimensions {
@@ -537,14 +627,17 @@ func (m operatorModel) renderTabbedHeader(subtitle string) string {
 
 	liveTab := tabIdle.Render("Live")
 	historyTab := tabIdle.Render("History")
+	shellTab := tabIdle.Render("Shell")
 	if m.activeTab == "live" {
 		liveTab = tabActive.Render("Live")
-	} else {
+	} else if m.activeTab == "history" {
 		historyTab = tabActive.Render("History")
+	} else {
+		shellTab = tabActive.Render("Shell")
 	}
 
 	return titleStyle.Render("c2-grpc Operator") + "\n" +
-		lipgloss.JoinHorizontal(lipgloss.Left, liveTab, " ", historyTab) + "\n" +
+		lipgloss.JoinHorizontal(lipgloss.Left, liveTab, " ", historyTab, " ", shellTab) + "\n" +
 		mutedStyle.Render(subtitle)
 }
 
@@ -552,7 +645,7 @@ func (m operatorModel) renderFooter(width int) string {
 	return panelStyle.Width(width).Render(
 		"Selected: " + m.selectedAgentLabel() + "\n" +
 			m.commandInput.View() + "\n" +
-			mutedStyle.Render("Enter dispatches. Tab opens History. Shift+Tab returns to Live. ↑/↓ select agents. PgUp/PgDn, Home/End, Ctrl+U/Ctrl+D scroll output. q quits.") + "\n" +
+			mutedStyle.Render("Enter dispatches. Tab cycles tabs. F1 Live, F2 History, F3 Shell. ↑/↓ select agents. PgUp/PgDn, Home/End, Ctrl+U/Ctrl+D scroll output. q quits.") + "\n" +
 			m.status,
 	)
 }
@@ -617,8 +710,25 @@ func maintainOperatorConnection(ctx context.Context, serverAddr string, ch chan<
 
 		client := pb.NewOperatorServiceClient(conn)
 		historyClient := pb.NewHistoryServiceClient(conn)
+		shellClient := pb.NewShellServiceClient(conn)
 		stream, err := client.Connect(ctx)
 		if err != nil {
+			_ = conn.Close()
+			select {
+			case <-ctx.Done():
+				return
+			case ch <- operatorDisconnectedMsg{message: fmt.Sprintf("Disconnected from server. Reconnecting to %s...", serverAddr)}:
+			}
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(3 * time.Second):
+			}
+			continue
+		}
+		shellStream, err := shellClient.OperatorShell(ctx)
+		if err != nil {
+			_ = stream.CloseSend()
 			_ = conn.Close()
 			select {
 			case <-ctx.Done():
@@ -636,32 +746,57 @@ func maintainOperatorConnection(ctx context.Context, serverAddr string, ch chan<
 		select {
 		case <-ctx.Done():
 			_ = stream.CloseSend()
+			_ = shellStream.CloseSend()
 			_ = conn.Close()
 			return
-		case ch <- operatorConnectedMsg{stream: stream, historyClient: historyClient}:
+		case ch <- operatorConnectedMsg{stream: stream, historyClient: historyClient, shellStream: shellStream}:
 		}
 
-		disconnected := false
-		for !disconnected {
-			event, err := stream.Recv()
-			if err == io.EOF {
-				disconnected = true
-				break
+		disconnectCh := make(chan struct{}, 2)
+
+		go func() {
+			for {
+				event, err := stream.Recv()
+				if err != nil {
+					disconnectCh <- struct{}{}
+					return
+				}
+				select {
+				case <-ctx.Done():
+					disconnectCh <- struct{}{}
+					return
+				case ch <- operatorEventMsg{event: event}:
+				}
 			}
-			if err != nil {
-				disconnected = true
-				break
+		}()
+
+		go func() {
+			for {
+				event, err := shellStream.Recv()
+				if err != nil {
+					disconnectCh <- struct{}{}
+					return
+				}
+				select {
+				case <-ctx.Done():
+					disconnectCh <- struct{}{}
+					return
+				case ch <- shellEventMsg{event: event}:
+				}
 			}
-			select {
-			case <-ctx.Done():
-				_ = stream.CloseSend()
-				_ = conn.Close()
-				return
-			case ch <- operatorEventMsg{event: event}:
-			}
+		}()
+
+		select {
+		case <-ctx.Done():
+			_ = stream.CloseSend()
+			_ = shellStream.CloseSend()
+			_ = conn.Close()
+			return
+		case <-disconnectCh:
 		}
 
 		_ = stream.CloseSend()
+		_ = shellStream.CloseSend()
 		_ = conn.Close()
 
 		select {
@@ -729,6 +864,49 @@ func sanitizeOutput(s string) string {
 		}
 		return r
 	}, s)
+}
+
+func sanitizeShellOutput(s string) string {
+	s = strings.ReplaceAll(s, "\r\n", "\n")
+	s = ansi.Strip(s)
+
+	var out []rune
+	for _, r := range s {
+		switch r {
+		case '\r':
+			continue
+		case '\n', '\t':
+			out = append(out, r)
+		case '\b', 0x7f:
+			out = append(out, r)
+		default:
+			if unicode.IsControl(r) {
+				continue
+			}
+			out = append(out, r)
+		}
+	}
+	return string(out)
+}
+
+func (m *operatorModel) appendShellOutput(chunk string) {
+	chunk = sanitizeShellOutput(chunk)
+	if chunk == "" {
+		return
+	}
+
+	out := []rune(m.shellOutput)
+	for _, r := range chunk {
+		switch r {
+		case '\b', 0x7f:
+			if len(out) > 0 && out[len(out)-1] != '\n' {
+				out = out[:len(out)-1]
+			}
+		default:
+			out = append(out, r)
+		}
+	}
+	m.shellOutput = string(out)
 }
 
 func (m *operatorModel) appendEvent(event *pb.OperatorEvent) {
@@ -835,6 +1013,205 @@ func (m *operatorModel) upsertHistoryEntry(agentID string, entry *pb.AgentHistor
 	m.historyCache[agentID] = updated
 }
 
+func (m *operatorModel) applyShellEvent(event *pb.AgentShellEvent) {
+	switch event.GetType() {
+	case "open_ok":
+		m.shellSessionID = event.GetSessionId()
+		m.shellAgentID = event.GetAgentId()
+		m.shellReady = true
+		m.shellOutput = ""
+		m.shellInputBuffer = ""
+		m.refreshShellViewport()
+		m.resizeShell()
+		m.status = fmt.Sprintf("Shell connected to agent:%s", shortAgentID(event.GetAgentId()))
+	case "open_error":
+		m.shellSessionID = ""
+		m.shellReady = false
+		m.status = "shell open error: " + event.GetMessage()
+	case "output":
+		if event.GetSessionId() != m.shellSessionID {
+			return
+		}
+		m.appendShellOutput(event.GetData())
+		const maxShellBytes = 128 * 1024
+		if len(m.shellOutput) > maxShellBytes {
+			m.shellOutput = m.shellOutput[len(m.shellOutput)-maxShellBytes:]
+		}
+		m.refreshShellViewport()
+	case "closed":
+		if event.GetSessionId() != m.shellSessionID {
+			return
+		}
+		m.shellReady = false
+		m.shellSessionID = ""
+		m.shellInputBuffer = ""
+		m.status = "shell closed"
+		if event.GetMessage() != "" {
+			m.status = "shell closed: " + event.GetMessage()
+		}
+	}
+}
+
+func (m *operatorModel) refreshShellViewport() {
+	if m.shellOutput == "" {
+		m.shellViewport.SetContent("No shell output yet.")
+		return
+	}
+	m.shellViewport.SetContent(m.shellOutput)
+	m.shellViewport.GotoBottom()
+}
+
+func (m *operatorModel) activateShellTab() tea.Cmd {
+	if m.shellStream == nil {
+		m.status = "Shell service unavailable."
+		return nil
+	}
+	if len(m.agentOrder) == 0 {
+		m.status = "No agents connected."
+		return nil
+	}
+
+	agentID := m.agentOrder[m.selected]
+	m.activeTab = "shell"
+	if m.shellReady && m.shellAgentID == agentID {
+		m.status = fmt.Sprintf("Shell attached to agent:%s", shortAgentID(agentID))
+		return nil
+	}
+
+	if m.shellSessionID != "" && m.shellAgentID != "" {
+		_ = m.shellStream.Send(&pb.OperatorShellRequest{
+			Type:      "close",
+			SessionId: m.shellSessionID,
+		})
+	}
+
+	m.shellSessionID = ""
+	m.shellReady = false
+	m.shellAgentID = agentID
+	m.shellOutput = ""
+	m.shellInputBuffer = ""
+	m.refreshShellViewport()
+	m.status = fmt.Sprintf("Opening shell for agent:%s...", shortAgentID(agentID))
+
+	if err := m.shellStream.Send(&pb.OperatorShellRequest{
+		Type:    "open",
+		AgentId: agentID,
+		Cols:    int32(maxInt(m.shellViewport.Width, 80)),
+		Rows:    int32(maxInt(m.shellViewport.Height, 24)),
+	}); err != nil {
+		m.status = fmt.Sprintf("shell open send error: %v", err)
+	}
+	return nil
+}
+
+func (m *operatorModel) sendShellInput(data string) {
+	if !m.shellReady || m.shellStream == nil || m.shellSessionID == "" {
+		return
+	}
+	if err := m.shellStream.Send(&pb.OperatorShellRequest{
+		Type:      "input",
+		SessionId: m.shellSessionID,
+		Data:      data,
+	}); err != nil {
+		m.status = fmt.Sprintf("shell input error: %v", err)
+	}
+}
+
+func (m *operatorModel) handleShellKey(msg tea.KeyMsg) {
+	switch msg.String() {
+	case "enter":
+		if strings.TrimSpace(m.shellInputBuffer) == "clear" {
+			m.sendShellInput("\x15")
+			m.shellOutput = ""
+			m.shellInputBuffer = ""
+			m.refreshShellViewport()
+			m.status = "Shell pane cleared."
+			return
+		}
+		m.sendShellInput("\r")
+		m.shellInputBuffer = ""
+		return
+	case "backspace":
+		m.sendShellInput("\x7f")
+		if len(m.shellInputBuffer) > 0 {
+			runes := []rune(m.shellInputBuffer)
+			m.shellInputBuffer = string(runes[:len(runes)-1])
+		}
+		return
+	case "delete":
+		m.sendShellInput("\x7f")
+		if len(m.shellInputBuffer) > 0 {
+			runes := []rune(m.shellInputBuffer)
+			m.shellInputBuffer = string(runes[:len(runes)-1])
+		}
+		return
+	case "ctrl+u":
+		m.sendShellInput("\x15")
+		m.shellInputBuffer = ""
+		return
+	case "ctrl+w":
+		m.sendShellInput("\x17")
+		m.shellInputBuffer = trimLastShellWord(m.shellInputBuffer)
+		return
+	case "ctrl+l":
+		m.sendShellInput("\x0c")
+		m.shellInputBuffer = ""
+		return
+	case "ctrl+d":
+		m.sendShellInput("\x04")
+		return
+	case "pgup":
+		m.shellViewport.HalfViewUp()
+		return
+	case "pgdown":
+		m.shellViewport.HalfViewDown()
+		return
+	case "home":
+		m.shellViewport.GotoTop()
+		return
+	case "end":
+		m.shellViewport.GotoBottom()
+		return
+	}
+
+	if input, ok := shellInputForKey(msg); ok {
+		m.sendShellInput(input)
+		if len(msg.Runes) > 0 {
+			m.shellInputBuffer += string(msg.Runes)
+		}
+	}
+}
+
+func (m operatorModel) renderShellInputIndicator() string {
+	if !m.shellReady {
+		return ""
+	}
+	return m.shellInputBuffer + "|"
+}
+
+func trimLastShellWord(s string) string {
+	runes := []rune(s)
+	for len(runes) > 0 && runes[len(runes)-1] == ' ' {
+		runes = runes[:len(runes)-1]
+	}
+	for len(runes) > 0 && runes[len(runes)-1] != ' ' {
+		runes = runes[:len(runes)-1]
+	}
+	return string(runes)
+}
+
+func (m *operatorModel) resizeShell() {
+	if !m.shellReady || m.shellStream == nil || m.shellSessionID == "" {
+		return
+	}
+	_ = m.shellStream.Send(&pb.OperatorShellRequest{
+		Type:      "resize",
+		SessionId: m.shellSessionID,
+		Cols:      int32(maxInt(m.shellViewport.Width, 80)),
+		Rows:      int32(maxInt(m.shellViewport.Height, 24)),
+	})
+}
+
 func (m *operatorModel) ensureHistorySelectionVisible() {
 	if len(m.historyEntries) == 0 {
 		m.historyListViewport.GotoTop()
@@ -872,6 +1249,37 @@ func shortAgentID(id string) string {
 		return id
 	}
 	return id[:8]
+}
+
+func shellInputForKey(msg tea.KeyMsg) (string, bool) {
+	switch msg.String() {
+	case "enter":
+		return "\r", true
+	case "backspace":
+		return "\x7f", true
+	case "tab":
+		return "\t", true
+	case "space":
+		return " ", true
+	case "up":
+		return "\x1b[A", true
+	case "down":
+		return "\x1b[B", true
+	case "right":
+		return "\x1b[C", true
+	case "left":
+		return "\x1b[D", true
+	case "home":
+		return "\x1b[H", true
+	case "end":
+		return "\x1b[F", true
+	case "delete":
+		return "\x1b[3~", true
+	}
+	if len(msg.Runes) > 0 {
+		return string(msg.Runes), true
+	}
+	return "", false
 }
 
 func cloneHistoryEntries(entries []*pb.AgentHistoryEntry) []*pb.AgentHistoryEntry {

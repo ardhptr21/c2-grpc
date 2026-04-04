@@ -29,6 +29,11 @@ service HistoryService {
   rpc ListAgentHistory(AgentHistoryRequest) returns (AgentHistoryResponse);
 }
 
+service ShellService {
+  rpc AgentShell(stream AgentShellEvent) returns (stream OperatorShellRequest);
+  rpc OperatorShell(stream OperatorShellRequest) returns (stream AgentShellEvent);
+}
+
 message RegisterRequest {
   string hostname = 1;
   string os = 2;
@@ -111,4 +116,21 @@ message AgentHistoryEntry {
 
 message AgentHistoryResponse {
   repeated AgentHistoryEntry entries = 1;
+}
+
+message OperatorShellRequest {
+  string type = 1;
+  string session_id = 2;
+  string agent_id = 3;
+  string data = 4;
+  int32 cols = 5;
+  int32 rows = 6;
+}
+
+message AgentShellEvent {
+  string type = 1;
+  string session_id = 2;
+  string agent_id = 3;
+  string data = 4;
+  string message = 5;
 }

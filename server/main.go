@@ -47,6 +47,21 @@ type TaskRecord struct {
 	ExecutedAt time.Time
 }
 
+type agentShellConn struct {
+	stream pb.ShellService_AgentShellServer
+	mu     sync.Mutex
+}
+
+type operatorShellConn struct {
+	stream pb.ShellService_OperatorShellServer
+	mu     sync.Mutex
+}
+
+type shellSession struct {
+	AgentID    string
+	OperatorID string
+}
+
 var (
 	agentsMu sync.RWMutex
 	agents   = make(map[string]*Agent)
@@ -65,6 +80,15 @@ var (
 
 	agentStreamsMu sync.Mutex
 	agentStreams   = make(map[string]pb.TaskService_ReceiveTasksServer)
+
+	agentShellsMu sync.Mutex
+	agentShells   = make(map[string]*agentShellConn)
+
+	operatorShellsMu sync.Mutex
+	operatorShells   = make(map[string]*operatorShellConn)
+
+	shellSessionsMu sync.Mutex
+	shellSessions   = make(map[string]shellSession)
 
 	mongoClient       *mongo.Client
 	historyCollection *mongo.Collection
@@ -92,6 +116,10 @@ type operatorServer struct {
 
 type historyServer struct {
 	pb.UnimplementedHistoryServiceServer
+}
+
+type shellServer struct {
+	pb.UnimplementedShellServiceServer
 }
 
 func shortUUID(n int) string {
@@ -133,6 +161,18 @@ func removeAgent(agentID string) (string, bool) {
 	delete(agentStreams, agentID)
 	agentStreamsMu.Unlock()
 
+	agentShellsMu.Lock()
+	delete(agentShells, agentID)
+	agentShellsMu.Unlock()
+
+	shellSessionsMu.Lock()
+	for sessionID, session := range shellSessions {
+		if session.AgentID == agentID {
+			delete(shellSessions, sessionID)
+		}
+	}
+	shellSessionsMu.Unlock()
+
 	return agent.Hostname, true
 }
 
@@ -159,6 +199,81 @@ func broadcastToOperators(event *pb.OperatorEvent) {
 
 	for _, stream := range streams {
 		_ = stream.Send(event)
+	}
+}
+
+func sendToAgentShell(agentID string, req *pb.OperatorShellRequest) error {
+	agentShellsMu.Lock()
+	conn, ok := agentShells[agentID]
+	agentShellsMu.Unlock()
+	if !ok {
+		return status.Error(codes.NotFound, "agent shell stream unavailable")
+	}
+
+	conn.mu.Lock()
+	defer conn.mu.Unlock()
+	return conn.stream.Send(req)
+}
+
+func sendToOperatorShell(operatorID string, event *pb.AgentShellEvent) error {
+	operatorShellsMu.Lock()
+	conn, ok := operatorShells[operatorID]
+	operatorShellsMu.Unlock()
+	if !ok {
+		return status.Error(codes.NotFound, "operator shell stream unavailable")
+	}
+
+	conn.mu.Lock()
+	defer conn.mu.Unlock()
+	return conn.stream.Send(event)
+}
+
+func closeShellSessionsForOperator(operatorID string) {
+	var requests []*pb.OperatorShellRequest
+
+	shellSessionsMu.Lock()
+	for sessionID, session := range shellSessions {
+		if session.OperatorID == operatorID {
+			requests = append(requests, &pb.OperatorShellRequest{
+				Type:      "close",
+				SessionId: sessionID,
+				AgentId:   session.AgentID,
+			})
+			delete(shellSessions, sessionID)
+		}
+	}
+	shellSessionsMu.Unlock()
+
+	for _, req := range requests {
+		_ = sendToAgentShell(req.GetAgentId(), req)
+	}
+}
+
+func closeShellSessionsForAgent(agentID string) {
+	var notify []struct {
+		operatorID string
+		sessionID  string
+	}
+
+	shellSessionsMu.Lock()
+	for sessionID, session := range shellSessions {
+		if session.AgentID == agentID {
+			notify = append(notify, struct {
+				operatorID string
+				sessionID  string
+			}{operatorID: session.OperatorID, sessionID: sessionID})
+			delete(shellSessions, sessionID)
+		}
+	}
+	shellSessionsMu.Unlock()
+
+	for _, item := range notify {
+		_ = sendToOperatorShell(item.operatorID, &pb.AgentShellEvent{
+			Type:      "closed",
+			SessionId: item.sessionID,
+			AgentId:   agentID,
+			Message:   "agent shell disconnected",
+		})
 	}
 }
 
@@ -594,6 +709,140 @@ func (s *historyServer) ListAgentHistory(ctx context.Context, req *pb.AgentHisto
 	return resp, nil
 }
 
+func (s *shellServer) AgentShell(stream pb.ShellService_AgentShellServer) error {
+	var agentID string
+
+	for {
+		event, err := stream.Recv()
+		if err == io.EOF {
+			if agentID != "" {
+				agentShellsMu.Lock()
+				delete(agentShells, agentID)
+				agentShellsMu.Unlock()
+				closeShellSessionsForAgent(agentID)
+			}
+			return nil
+		}
+		if err != nil {
+			if agentID != "" {
+				agentShellsMu.Lock()
+				delete(agentShells, agentID)
+				agentShellsMu.Unlock()
+				closeShellSessionsForAgent(agentID)
+			}
+			return err
+		}
+
+		if event.GetType() == "register" {
+			agentID = event.GetAgentId()
+			agentShellsMu.Lock()
+			agentShells[agentID] = &agentShellConn{stream: stream}
+			agentShellsMu.Unlock()
+			continue
+		}
+
+		shellSessionsMu.Lock()
+		session, ok := shellSessions[event.GetSessionId()]
+		shellSessionsMu.Unlock()
+		if !ok {
+			continue
+		}
+		_ = sendToOperatorShell(session.OperatorID, event)
+		if event.GetType() == "closed" || event.GetType() == "open_error" {
+			shellSessionsMu.Lock()
+			delete(shellSessions, event.GetSessionId())
+			shellSessionsMu.Unlock()
+		}
+	}
+}
+
+func (s *shellServer) OperatorShell(stream pb.ShellService_OperatorShellServer) error {
+	operatorID := shortUUID(8)
+
+	operatorShellsMu.Lock()
+	operatorShells[operatorID] = &operatorShellConn{stream: stream}
+	operatorShellsMu.Unlock()
+	defer func() {
+		operatorShellsMu.Lock()
+		delete(operatorShells, operatorID)
+		operatorShellsMu.Unlock()
+		closeShellSessionsForOperator(operatorID)
+	}()
+
+	for {
+		req, err := stream.Recv()
+		if err == io.EOF || stream.Context().Err() != nil {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+
+		switch req.GetType() {
+		case "open":
+			if req.GetAgentId() == "" {
+				_ = sendToOperatorShell(operatorID, &pb.AgentShellEvent{
+					Type:    "open_error",
+					AgentId: req.GetAgentId(),
+					Message: "agent_id is required",
+				})
+				continue
+			}
+
+			sessionID := shortUUID(12)
+			shellSessionsMu.Lock()
+			shellSessions[sessionID] = shellSession{
+				AgentID:    req.GetAgentId(),
+				OperatorID: operatorID,
+			}
+			shellSessionsMu.Unlock()
+
+			forward := &pb.OperatorShellRequest{
+				Type:      "open",
+				SessionId: sessionID,
+				AgentId:   req.GetAgentId(),
+				Cols:      req.GetCols(),
+				Rows:      req.GetRows(),
+			}
+			if err := sendToAgentShell(req.GetAgentId(), forward); err != nil {
+				shellSessionsMu.Lock()
+				delete(shellSessions, sessionID)
+				shellSessionsMu.Unlock()
+				_ = sendToOperatorShell(operatorID, &pb.AgentShellEvent{
+					Type:      "open_error",
+					SessionId: sessionID,
+					AgentId:   req.GetAgentId(),
+					Message:   err.Error(),
+				})
+			}
+		case "input", "resize", "close":
+			shellSessionsMu.Lock()
+			session, ok := shellSessions[req.GetSessionId()]
+			shellSessionsMu.Unlock()
+			if !ok {
+				continue
+			}
+			req.AgentId = session.AgentID
+			if err := sendToAgentShell(session.AgentID, req); err != nil {
+				_ = sendToOperatorShell(operatorID, &pb.AgentShellEvent{
+					Type:      "closed",
+					SessionId: req.GetSessionId(),
+					AgentId:   session.AgentID,
+					Message:   err.Error(),
+				})
+				shellSessionsMu.Lock()
+				delete(shellSessions, req.GetSessionId())
+				shellSessionsMu.Unlock()
+			}
+			if req.GetType() == "close" {
+				shellSessionsMu.Lock()
+				delete(shellSessions, req.GetSessionId())
+				shellSessionsMu.Unlock()
+			}
+		}
+	}
+}
+
 func pushTaskToAgent(agentID string, task pb.Task) {
 	agentStreamsMu.Lock()
 	stream, ok := agentStreams[agentID]
@@ -640,6 +889,7 @@ func main() {
 	pb.RegisterOutputServiceServer(s, &outputServer{})
 	pb.RegisterOperatorServiceServer(s, &operatorServer{})
 	pb.RegisterHistoryServiceServer(s, &historyServer{})
+	pb.RegisterShellServiceServer(s, &shellServer{})
 
 	go startWatchdog()
 

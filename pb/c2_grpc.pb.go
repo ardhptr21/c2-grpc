@@ -728,3 +728,196 @@ var HistoryService_ServiceDesc = grpc.ServiceDesc{
 	Streams:  []grpc.StreamDesc{},
 	Metadata: "c2.proto",
 }
+
+const (
+	ShellService_AgentShell_FullMethodName    = "/c2grpc.ShellService/AgentShell"
+	ShellService_OperatorShell_FullMethodName = "/c2grpc.ShellService/OperatorShell"
+)
+
+// ShellServiceClient is the client API for ShellService service.
+//
+// For semantics around ctx use and closing/ending streaming RPCs, please refer to https://pkg.go.dev/google.golang.org/grpc/?tab=doc#ClientConn.NewStream.
+type ShellServiceClient interface {
+	AgentShell(ctx context.Context, opts ...grpc.CallOption) (ShellService_AgentShellClient, error)
+	OperatorShell(ctx context.Context, opts ...grpc.CallOption) (ShellService_OperatorShellClient, error)
+}
+
+type shellServiceClient struct {
+	cc grpc.ClientConnInterface
+}
+
+func NewShellServiceClient(cc grpc.ClientConnInterface) ShellServiceClient {
+	return &shellServiceClient{cc}
+}
+
+func (c *shellServiceClient) AgentShell(ctx context.Context, opts ...grpc.CallOption) (ShellService_AgentShellClient, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	stream, err := c.cc.NewStream(ctx, &ShellService_ServiceDesc.Streams[0], ShellService_AgentShell_FullMethodName, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	x := &shellServiceAgentShellClient{ClientStream: stream}
+	return x, nil
+}
+
+type ShellService_AgentShellClient interface {
+	Send(*AgentShellEvent) error
+	Recv() (*OperatorShellRequest, error)
+	grpc.ClientStream
+}
+
+type shellServiceAgentShellClient struct {
+	grpc.ClientStream
+}
+
+func (x *shellServiceAgentShellClient) Send(m *AgentShellEvent) error {
+	return x.ClientStream.SendMsg(m)
+}
+
+func (x *shellServiceAgentShellClient) Recv() (*OperatorShellRequest, error) {
+	m := new(OperatorShellRequest)
+	if err := x.ClientStream.RecvMsg(m); err != nil {
+		return nil, err
+	}
+	return m, nil
+}
+
+func (c *shellServiceClient) OperatorShell(ctx context.Context, opts ...grpc.CallOption) (ShellService_OperatorShellClient, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	stream, err := c.cc.NewStream(ctx, &ShellService_ServiceDesc.Streams[1], ShellService_OperatorShell_FullMethodName, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	x := &shellServiceOperatorShellClient{ClientStream: stream}
+	return x, nil
+}
+
+type ShellService_OperatorShellClient interface {
+	Send(*OperatorShellRequest) error
+	Recv() (*AgentShellEvent, error)
+	grpc.ClientStream
+}
+
+type shellServiceOperatorShellClient struct {
+	grpc.ClientStream
+}
+
+func (x *shellServiceOperatorShellClient) Send(m *OperatorShellRequest) error {
+	return x.ClientStream.SendMsg(m)
+}
+
+func (x *shellServiceOperatorShellClient) Recv() (*AgentShellEvent, error) {
+	m := new(AgentShellEvent)
+	if err := x.ClientStream.RecvMsg(m); err != nil {
+		return nil, err
+	}
+	return m, nil
+}
+
+// ShellServiceServer is the server API for ShellService service.
+// All implementations must embed UnimplementedShellServiceServer
+// for forward compatibility
+type ShellServiceServer interface {
+	AgentShell(ShellService_AgentShellServer) error
+	OperatorShell(ShellService_OperatorShellServer) error
+	mustEmbedUnimplementedShellServiceServer()
+}
+
+// UnimplementedShellServiceServer must be embedded to have forward compatible implementations.
+type UnimplementedShellServiceServer struct {
+}
+
+func (UnimplementedShellServiceServer) AgentShell(ShellService_AgentShellServer) error {
+	return status.Errorf(codes.Unimplemented, "method AgentShell not implemented")
+}
+func (UnimplementedShellServiceServer) OperatorShell(ShellService_OperatorShellServer) error {
+	return status.Errorf(codes.Unimplemented, "method OperatorShell not implemented")
+}
+func (UnimplementedShellServiceServer) mustEmbedUnimplementedShellServiceServer() {}
+
+// UnsafeShellServiceServer may be embedded to opt out of forward compatibility for this service.
+// Use of this interface is not recommended, as added methods to ShellServiceServer will
+// result in compilation errors.
+type UnsafeShellServiceServer interface {
+	mustEmbedUnimplementedShellServiceServer()
+}
+
+func RegisterShellServiceServer(s grpc.ServiceRegistrar, srv ShellServiceServer) {
+	s.RegisterService(&ShellService_ServiceDesc, srv)
+}
+
+func _ShellService_AgentShell_Handler(srv interface{}, stream grpc.ServerStream) error {
+	return srv.(ShellServiceServer).AgentShell(&shellServiceAgentShellServer{ServerStream: stream})
+}
+
+type ShellService_AgentShellServer interface {
+	Send(*OperatorShellRequest) error
+	Recv() (*AgentShellEvent, error)
+	grpc.ServerStream
+}
+
+type shellServiceAgentShellServer struct {
+	grpc.ServerStream
+}
+
+func (x *shellServiceAgentShellServer) Send(m *OperatorShellRequest) error {
+	return x.ServerStream.SendMsg(m)
+}
+
+func (x *shellServiceAgentShellServer) Recv() (*AgentShellEvent, error) {
+	m := new(AgentShellEvent)
+	if err := x.ServerStream.RecvMsg(m); err != nil {
+		return nil, err
+	}
+	return m, nil
+}
+
+func _ShellService_OperatorShell_Handler(srv interface{}, stream grpc.ServerStream) error {
+	return srv.(ShellServiceServer).OperatorShell(&shellServiceOperatorShellServer{ServerStream: stream})
+}
+
+type ShellService_OperatorShellServer interface {
+	Send(*AgentShellEvent) error
+	Recv() (*OperatorShellRequest, error)
+	grpc.ServerStream
+}
+
+type shellServiceOperatorShellServer struct {
+	grpc.ServerStream
+}
+
+func (x *shellServiceOperatorShellServer) Send(m *AgentShellEvent) error {
+	return x.ServerStream.SendMsg(m)
+}
+
+func (x *shellServiceOperatorShellServer) Recv() (*OperatorShellRequest, error) {
+	m := new(OperatorShellRequest)
+	if err := x.ServerStream.RecvMsg(m); err != nil {
+		return nil, err
+	}
+	return m, nil
+}
+
+// ShellService_ServiceDesc is the grpc.ServiceDesc for ShellService service.
+// It's only intended for direct use with grpc.RegisterService,
+// and not to be introspected or modified (even as a copy)
+var ShellService_ServiceDesc = grpc.ServiceDesc{
+	ServiceName: "c2grpc.ShellService",
+	HandlerType: (*ShellServiceServer)(nil),
+	Methods:     []grpc.MethodDesc{},
+	Streams: []grpc.StreamDesc{
+		{
+			StreamName:    "AgentShell",
+			Handler:       _ShellService_AgentShell_Handler,
+			ServerStreams: true,
+			ClientStreams: true,
+		},
+		{
+			StreamName:    "OperatorShell",
+			Handler:       _ShellService_OperatorShell_Handler,
+			ServerStreams: true,
+			ClientStreams: true,
+		},
+	},
+	Metadata: "c2.proto",
+}
