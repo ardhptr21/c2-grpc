@@ -637,3 +637,94 @@ var OperatorService_ServiceDesc = grpc.ServiceDesc{
 	},
 	Metadata: "c2.proto",
 }
+
+const (
+	HistoryService_ListAgentHistory_FullMethodName = "/c2grpc.HistoryService/ListAgentHistory"
+)
+
+// HistoryServiceClient is the client API for HistoryService service.
+//
+// For semantics around ctx use and closing/ending streaming RPCs, please refer to https://pkg.go.dev/google.golang.org/grpc/?tab=doc#ClientConn.NewStream.
+type HistoryServiceClient interface {
+	ListAgentHistory(ctx context.Context, in *AgentHistoryRequest, opts ...grpc.CallOption) (*AgentHistoryResponse, error)
+}
+
+type historyServiceClient struct {
+	cc grpc.ClientConnInterface
+}
+
+func NewHistoryServiceClient(cc grpc.ClientConnInterface) HistoryServiceClient {
+	return &historyServiceClient{cc}
+}
+
+func (c *historyServiceClient) ListAgentHistory(ctx context.Context, in *AgentHistoryRequest, opts ...grpc.CallOption) (*AgentHistoryResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(AgentHistoryResponse)
+	err := c.cc.Invoke(ctx, HistoryService_ListAgentHistory_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// HistoryServiceServer is the server API for HistoryService service.
+// All implementations must embed UnimplementedHistoryServiceServer
+// for forward compatibility
+type HistoryServiceServer interface {
+	ListAgentHistory(context.Context, *AgentHistoryRequest) (*AgentHistoryResponse, error)
+	mustEmbedUnimplementedHistoryServiceServer()
+}
+
+// UnimplementedHistoryServiceServer must be embedded to have forward compatible implementations.
+type UnimplementedHistoryServiceServer struct {
+}
+
+func (UnimplementedHistoryServiceServer) ListAgentHistory(context.Context, *AgentHistoryRequest) (*AgentHistoryResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method ListAgentHistory not implemented")
+}
+func (UnimplementedHistoryServiceServer) mustEmbedUnimplementedHistoryServiceServer() {}
+
+// UnsafeHistoryServiceServer may be embedded to opt out of forward compatibility for this service.
+// Use of this interface is not recommended, as added methods to HistoryServiceServer will
+// result in compilation errors.
+type UnsafeHistoryServiceServer interface {
+	mustEmbedUnimplementedHistoryServiceServer()
+}
+
+func RegisterHistoryServiceServer(s grpc.ServiceRegistrar, srv HistoryServiceServer) {
+	s.RegisterService(&HistoryService_ServiceDesc, srv)
+}
+
+func _HistoryService_ListAgentHistory_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(AgentHistoryRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(HistoryServiceServer).ListAgentHistory(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: HistoryService_ListAgentHistory_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(HistoryServiceServer).ListAgentHistory(ctx, req.(*AgentHistoryRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+// HistoryService_ServiceDesc is the grpc.ServiceDesc for HistoryService service.
+// It's only intended for direct use with grpc.RegisterService,
+// and not to be introspected or modified (even as a copy)
+var HistoryService_ServiceDesc = grpc.ServiceDesc{
+	ServiceName: "c2grpc.HistoryService",
+	HandlerType: (*HistoryServiceServer)(nil),
+	Methods: []grpc.MethodDesc{
+		{
+			MethodName: "ListAgentHistory",
+			Handler:    _HistoryService_ListAgentHistory_Handler,
+		},
+	},
+	Streams:  []grpc.StreamDesc{},
+	Metadata: "c2.proto",
+}

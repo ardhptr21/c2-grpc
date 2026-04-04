@@ -25,10 +25,15 @@ service OperatorService {
   rpc Connect(stream OperatorCommand) returns (stream OperatorEvent);
 }
 
+service HistoryService {
+  rpc ListAgentHistory(AgentHistoryRequest) returns (AgentHistoryResponse);
+}
+
 message RegisterRequest {
   string hostname = 1;
   string os = 2;
   string ip = 3;
+  string machine_id = 4;
 }
 
 message RegisterResponse {
@@ -87,4 +92,23 @@ message OperatorEvent {
   string type = 1;
   string agent_id = 2;
   string payload = 3;
+}
+
+message AgentHistoryRequest {
+  string agent_id = 1;
+  int32 limit = 2;
+}
+
+message AgentHistoryEntry {
+  string task_id = 1;
+  string agent_id = 2;
+  string command = 3;
+  string args = 4;
+  string output = 5;
+  int64 executed_at = 6;
+  int64 completed_at = 7;
+}
+
+message AgentHistoryResponse {
+  repeated AgentHistoryEntry entries = 1;
 }
