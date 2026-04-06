@@ -648,7 +648,7 @@ func (s *agentServer) Register(ctx context.Context, req *pb.RegisterRequest) (*p
 	go broadcastToOperators(&pb.OperatorEvent{
 		Type:    "agent_joined",
 		AgentId: machineID,
-		Payload: fmt.Sprintf("%s @ %s", req.GetHostname(), req.GetIp()),
+		Payload: fmt.Sprintf("%s @ %s [ALIVE]", req.GetHostname(), req.GetIp()),
 	})
 
 	return &pb.RegisterResponse{

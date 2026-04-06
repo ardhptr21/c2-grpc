@@ -683,7 +683,16 @@ func (m *operatorModel) applyEvent(event *pb.OperatorEvent) tea.Cmd {
 		m.agents[event.GetAgentId()] = row
 		m.rebuildAgentOrder()
 	case "agent_removed":
-		delete(m.agents, event.GetAgentId())
+		row := m.agents[event.GetAgentId()]
+		row.ID = event.GetAgentId()
+		if strings.TrimSpace(row.Summary) == "" {
+			row.Summary = event.GetPayload()
+		}
+		if strings.TrimSpace(row.Summary) == "" {
+			row.Summary = "OFFLINE"
+		}
+		row.Status = "OFFLINE"
+		m.agents[event.GetAgentId()] = row
 		m.rebuildAgentOrder()
 	case "history_updated":
 		var entry pb.AgentHistoryEntry
@@ -851,11 +860,15 @@ func (m operatorModel) renderAgents() string {
 		if !ok {
 			agent = agentRow{
 				ID:      id,
-				Summary: "saved history available",
+				Summary: "OFFLINE",
 				Status:  "OFFLINE",
 			}
 		}
-		row := fmt.Sprintf("%s  %s", shortAgentID(id), agent.Summary)
+		summary := agent.Summary
+		if agent.Status == "OFFLINE" {
+			summary = renderOfflineSummary(summary)
+		}
+		row := fmt.Sprintf("%s  %s", shortAgentID(id), summary)
 		if agent.Status == "DEAD" || agent.Status == "OFFLINE" {
 			row = deadRow.Render(row)
 		}
@@ -2406,6 +2419,23 @@ func extractStatus(payload string) string {
 		return ""
 	}
 	return payload[start+1 : end]
+}
+
+func renderOfflineSummary(summary string) string {
+	summary = strings.TrimSpace(summary)
+	if summary == "" {
+		return "[OFFLINE]"
+	}
+
+	start := strings.LastIndex(summary, "[")
+	end := strings.LastIndex(summary, "]")
+	if start != -1 && end == len(summary)-1 && end > start {
+		summary = strings.TrimSpace(summary[:start])
+	}
+	if summary == "" {
+		return "[OFFLINE]"
+	}
+	return summary + " [OFFLINE]"
 }
 
 func maxInt(a, b int) int {
