@@ -65,31 +65,19 @@ type fileEventMsg struct {
 	event *pb.AgentFileEvent
 }
 
-type uploadProgressMsg struct {
-	transferID string
-	sentBytes  int64
-	totalBytes int64
-}
-
-type uploadDoneMsg struct {
-	transferID string
-}
-
-type uploadErrorMsg struct {
-	transferID string
-	message    string
-}
-
 type activeDownload struct {
-	localPath string
-	file      *os.File
+	localPath     string
+	remotePath    string
+	file          *os.File
+	totalBytes    int64
+	receivedBytes int64
 }
 
 type activeUpload struct {
-	localPath  string
-	remotePath string
-	totalBytes int64
-	sentBytes  int64
+	localPath        string
+	remotePath       string
+	totalBytes       int64
+	transferredBytes int64
 }
 
 type remoteFileEntry struct {
@@ -327,23 +315,6 @@ func (m operatorModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, waitForOperatorEvent(m.events)
 	case fileEventMsg:
 		m.applyFileEvent(msg.event)
-		return m, waitForOperatorEvent(m.events)
-	case uploadProgressMsg:
-		if upload := m.fileUploads[msg.transferID]; upload != nil {
-			upload.sentBytes = msg.sentBytes
-			upload.totalBytes = msg.totalBytes
-			m.refreshFileViewport()
-		}
-		return m, waitForOperatorEvent(m.events)
-	case uploadDoneMsg:
-		delete(m.fileUploads, msg.transferID)
-		m.refreshFileViewport()
-		return m, waitForOperatorEvent(m.events)
-	case uploadErrorMsg:
-		delete(m.fileUploads, msg.transferID)
-		m.appendFileLog("[x] upload error: " + msg.message)
-		m.refreshFileViewport()
-		m.status = "upload error: " + msg.message
 		return m, waitForOperatorEvent(m.events)
 	case tea.KeyMsg:
 		switch msg.String() {
@@ -1449,14 +1420,32 @@ func (m *operatorModel) applyFileEvent(event *pb.AgentFileEvent) {
 			m.status = "download write error: " + err.Error()
 			return
 		}
+		download.remotePath = event.GetPath()
+		download.totalBytes = event.GetTotalBytes()
+		download.receivedBytes = event.GetTransferredBytes()
 	case "download_done":
 		localPath := m.downloadLocalPath(event.GetTransferId())
+		if download := m.fileDownloads[event.GetTransferId()]; download != nil {
+			download.totalBytes = event.GetTotalBytes()
+			download.receivedBytes = event.GetTransferredBytes()
+		}
 		m.closeDownload(event.GetTransferId())
-		m.appendFileLog(fmt.Sprintf("[>] downloaded agent:%s %s -> %s", shortAgentID(event.GetAgentId()), event.GetPath(), localPath))
+		m.appendFileLog(fmt.Sprintf("[>] downloaded agent:%s %s -> %s (%s)", shortAgentID(event.GetAgentId()), event.GetPath(), localPath, formatBytes(event.GetTransferredBytes())))
 		m.status = "download completed"
+	case "upload_progress":
+		upload := m.fileUploads[event.GetTransferId()]
+		if upload == nil {
+			return
+		}
+		upload.totalBytes = event.GetTotalBytes()
+		upload.transferredBytes = event.GetTransferredBytes()
 	case "upload_done":
+		if upload := m.fileUploads[event.GetTransferId()]; upload != nil {
+			upload.totalBytes = event.GetTotalBytes()
+			upload.transferredBytes = event.GetTransferredBytes()
+		}
 		delete(m.fileUploads, event.GetTransferId())
-		m.appendFileLog(fmt.Sprintf("[<] uploaded to agent:%s %s", shortAgentID(event.GetAgentId()), event.GetPath()))
+		m.appendFileLog(fmt.Sprintf("[<] uploaded to agent:%s %s (%s)", shortAgentID(event.GetAgentId()), event.GetPath(), formatBytes(event.GetTransferredBytes())))
 		m.status = "upload completed"
 	case "error":
 		if event.GetTransferId() == m.fileListTransferID {
@@ -1503,6 +1492,19 @@ func (m *operatorModel) refreshFileViewport() {
 		for _, transferID := range ids {
 			upload := m.fileUploads[transferID]
 			lines = append(lines, formatUploadProgress(upload))
+		}
+		sections = append(sections, strings.Join(lines, "\n"))
+	}
+	if len(m.fileDownloads) > 0 {
+		ids := make([]string, 0, len(m.fileDownloads))
+		for transferID := range m.fileDownloads {
+			ids = append(ids, transferID)
+		}
+		sort.Strings(ids)
+		lines := []string{"Active Downloads", ""}
+		for _, transferID := range ids {
+			download := m.fileDownloads[transferID]
+			lines = append(lines, formatDownloadProgress(download))
 		}
 		sections = append(sections, strings.Join(lines, "\n"))
 	}
@@ -1849,6 +1851,7 @@ func (m *operatorModel) uploadFile(agentID, localPath, remotePath string) error 
 		AgentId:    agentID,
 		Path:       remotePath,
 		Message:    sourceName,
+		TotalBytes: info.Size(),
 	}); err != nil {
 		_ = f.Close()
 		return fmt.Errorf("start upload: %w", err)
@@ -1859,10 +1862,9 @@ func (m *operatorModel) uploadFile(agentID, localPath, remotePath string) error 
 		remotePath: remotePath,
 		totalBytes: info.Size(),
 	}
-	go func(transferID, remotePath string, totalBytes int64, f *os.File) {
+	go func(transferID, remotePath string, f *os.File) {
 		defer f.Close()
 
-		var sentBytes int64
 		buf := make([]byte, 32*1024)
 		for {
 			n, err := f.Read(buf)
@@ -1873,17 +1875,27 @@ func (m *operatorModel) uploadFile(agentID, localPath, remotePath string) error 
 					Path:       remotePath,
 					Data:       append([]byte(nil), buf[:n]...),
 				}); sendErr != nil {
-					m.events <- uploadErrorMsg{transferID: transferID, message: sendErr.Error()}
+					m.events <- fileEventMsg{event: &pb.AgentFileEvent{
+						Type:       "error",
+						TransferId: transferID,
+						AgentId:    agentID,
+						Path:       remotePath,
+						Message:    sendErr.Error(),
+					}}
 					return
 				}
-				sentBytes += int64(n)
-				m.events <- uploadProgressMsg{transferID: transferID, sentBytes: sentBytes, totalBytes: totalBytes}
 			}
 			if err == io.EOF {
 				break
 			}
 			if err != nil {
-				m.events <- uploadErrorMsg{transferID: transferID, message: err.Error()}
+				m.events <- fileEventMsg{event: &pb.AgentFileEvent{
+					Type:       "error",
+					TransferId: transferID,
+					AgentId:    agentID,
+					Path:       remotePath,
+					Message:    err.Error(),
+				}}
 				return
 			}
 		}
@@ -1893,12 +1905,16 @@ func (m *operatorModel) uploadFile(agentID, localPath, remotePath string) error 
 			TransferId: transferID,
 			Path:       remotePath,
 		}); err != nil {
-			m.events <- uploadErrorMsg{transferID: transferID, message: err.Error()}
+			m.events <- fileEventMsg{event: &pb.AgentFileEvent{
+				Type:       "error",
+				TransferId: transferID,
+				AgentId:    agentID,
+				Path:       remotePath,
+				Message:    err.Error(),
+			}}
 			return
 		}
-
-		m.events <- uploadDoneMsg{transferID: transferID}
-	}(transferID, remotePath, info.Size(), f)
+	}(transferID, remotePath, f)
 
 	m.appendFileLog(fmt.Sprintf("[<] uploading %s -> agent:%s %s", localPath, shortAgentID(agentID), remotePath))
 	m.refreshFileViewport()
@@ -1921,8 +1937,9 @@ func (m *operatorModel) downloadFile(agentID, remotePath, localPath string) erro
 
 	transferID := nextTransferID()
 	m.fileDownloads[transferID] = &activeDownload{
-		localPath: finalLocalPath,
-		file:      f,
+		localPath:  finalLocalPath,
+		remotePath: remotePath,
+		file:       f,
 	}
 
 	if err := m.sendFileRequest(&pb.OperatorFileRequest{
@@ -2144,10 +2161,10 @@ func formatUploadProgress(upload *activeUpload) string {
 		return ""
 	}
 	total := upload.totalBytes
-	sent := upload.sentBytes
+	transferred := upload.transferredBytes
 	percent := 0.0
 	if total > 0 {
-		percent = float64(sent) / float64(total)
+		percent = float64(transferred) / float64(total)
 		if percent > 1 {
 			percent = 1
 		}
@@ -2158,7 +2175,29 @@ func formatUploadProgress(upload *activeUpload) string {
 		filled = barWidth
 	}
 	bar := strings.Repeat("#", filled) + strings.Repeat("-", barWidth-filled)
-	return fmt.Sprintf("[%s] %6.1f%%  %s -> %s (%s / %s)", bar, percent*100, upload.localPath, upload.remotePath, formatBytes(sent), formatBytes(total))
+	return fmt.Sprintf("[%s] %6.1f%%  %s -> %s (%s / %s)", bar, percent*100, upload.localPath, upload.remotePath, formatBytes(transferred), formatBytes(total))
+}
+
+func formatDownloadProgress(download *activeDownload) string {
+	if download == nil {
+		return ""
+	}
+	total := download.totalBytes
+	received := download.receivedBytes
+	percent := 0.0
+	if total > 0 {
+		percent = float64(received) / float64(total)
+		if percent > 1 {
+			percent = 1
+		}
+	}
+	barWidth := 18
+	filled := int(percent * float64(barWidth))
+	if filled > barWidth {
+		filled = barWidth
+	}
+	bar := strings.Repeat("#", filled) + strings.Repeat("-", barWidth-filled)
+	return fmt.Sprintf("[%s] %6.1f%%  %s -> %s (%s / %s)", bar, percent*100, download.remotePath, download.localPath, formatBytes(received), formatBytes(total))
 }
 
 func formatBytes(v int64) string {

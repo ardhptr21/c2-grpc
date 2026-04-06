@@ -46,8 +46,10 @@ type shellSession struct {
 }
 
 type uploadTarget struct {
-	file *os.File
-	path string
+	file             *os.File
+	path             string
+	totalBytes       int64
+	transferredBytes int64
 }
 
 var errAgentAlreadyRegistered = errors.New("agent already registered")
@@ -491,13 +493,17 @@ func startFileBridge(ctx context.Context, cancel context.CancelCauseFunc, client
 				continue
 			}
 			uploadsMu.Lock()
-			uploads[req.GetTransferId()] = &uploadTarget{file: f, path: targetPath}
+			uploads[req.GetTransferId()] = &uploadTarget{
+				file:       f,
+				path:       targetPath,
+				totalBytes: req.GetTotalBytes(),
+			}
 			uploadsMu.Unlock()
 		case "upload_chunk":
 			uploadsMu.Lock()
 			target := uploads[req.GetTransferId()]
-			uploadsMu.Unlock()
 			if target == nil || target.file == nil {
+				uploadsMu.Unlock()
 				_ = sendEvent(&pb.AgentFileEvent{
 					Type:       "error",
 					TransferId: req.GetTransferId(),
@@ -507,7 +513,9 @@ func startFileBridge(ctx context.Context, cancel context.CancelCauseFunc, client
 				})
 				continue
 			}
-			if _, err := target.file.Write(req.GetData()); err != nil {
+			n, err := target.file.Write(req.GetData())
+			if err != nil {
+				uploadsMu.Unlock()
 				closeUpload(req.GetTransferId())
 				_ = sendEvent(&pb.AgentFileEvent{
 					Type:       "error",
@@ -516,22 +524,42 @@ func startFileBridge(ctx context.Context, cancel context.CancelCauseFunc, client
 					Path:       target.path,
 					Message:    err.Error(),
 				})
+				continue
 			}
+			target.transferredBytes += int64(n)
+			progress := target.transferredBytes
+			total := target.totalBytes
+			path := target.path
+			uploadsMu.Unlock()
+			_ = sendEvent(&pb.AgentFileEvent{
+				Type:             "upload_progress",
+				TransferId:       req.GetTransferId(),
+				AgentId:          agentID,
+				Path:             path,
+				TotalBytes:       total,
+				TransferredBytes: progress,
+			})
 		case "upload_end":
 			uploadsMu.Lock()
 			target := uploads[req.GetTransferId()]
 			uploadsMu.Unlock()
 			closeUpload(req.GetTransferId())
 			finalPath := req.GetPath()
+			totalBytes := int64(0)
+			transferredBytes := int64(0)
 			if target != nil {
 				finalPath = target.path
+				totalBytes = target.totalBytes
+				transferredBytes = target.transferredBytes
 			}
 			_ = sendEvent(&pb.AgentFileEvent{
-				Type:       "upload_done",
-				TransferId: req.GetTransferId(),
-				AgentId:    agentID,
-				Path:       finalPath,
-				Message:    "upload completed",
+				Type:             "upload_done",
+				TransferId:       req.GetTransferId(),
+				AgentId:          agentID,
+				Path:             finalPath,
+				Message:          "upload completed",
+				TotalBytes:       totalBytes,
+				TransferredBytes: transferredBytes,
 			})
 		case "download":
 			go func(req *pb.OperatorFileRequest) {
@@ -548,16 +576,33 @@ func startFileBridge(ctx context.Context, cancel context.CancelCauseFunc, client
 				}
 				defer f.Close()
 
+				info, err := f.Stat()
+				if err != nil {
+					_ = sendEvent(&pb.AgentFileEvent{
+						Type:       "error",
+						TransferId: req.GetTransferId(),
+						AgentId:    agentID,
+						Path:       req.GetPath(),
+						Message:    err.Error(),
+					})
+					return
+				}
+
+				totalBytes := info.Size()
+				var transferredBytes int64
 				buf := make([]byte, 32*1024)
 				for {
 					n, err := f.Read(buf)
 					if n > 0 {
+						transferredBytes += int64(n)
 						if sendErr := sendEvent(&pb.AgentFileEvent{
-							Type:       "download_chunk",
-							TransferId: req.GetTransferId(),
-							AgentId:    agentID,
-							Path:       req.GetPath(),
-							Data:       append([]byte(nil), buf[:n]...),
+							Type:             "download_chunk",
+							TransferId:       req.GetTransferId(),
+							AgentId:          agentID,
+							Path:             req.GetPath(),
+							Data:             append([]byte(nil), buf[:n]...),
+							TotalBytes:       totalBytes,
+							TransferredBytes: transferredBytes,
 						}); sendErr != nil {
 							return
 						}
@@ -578,11 +623,13 @@ func startFileBridge(ctx context.Context, cancel context.CancelCauseFunc, client
 				}
 
 				_ = sendEvent(&pb.AgentFileEvent{
-					Type:       "download_done",
-					TransferId: req.GetTransferId(),
-					AgentId:    agentID,
-					Path:       req.GetPath(),
-					Message:    "download completed",
+					Type:             "download_done",
+					TransferId:       req.GetTransferId(),
+					AgentId:          agentID,
+					Path:             req.GetPath(),
+					Message:          "download completed",
+					TotalBytes:       totalBytes,
+					TransferredBytes: transferredBytes,
 				})
 			}(req)
 		case "list":
