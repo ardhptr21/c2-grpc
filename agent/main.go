@@ -39,8 +39,10 @@ var (
 )
 
 type shellSession struct {
-	cmd  *exec.Cmd
-	ptmx *os.File
+	cmd    *exec.Cmd
+	ptmx   *os.File
+	stdin  io.WriteCloser
+	stdout io.ReadCloser
 }
 
 type uploadTarget struct {
@@ -262,7 +264,15 @@ func startShellBridge(ctx context.Context, cancel context.CancelCauseFunc, clien
 			return
 		}
 
-		_ = session.ptmx.Close()
+		if session.ptmx != nil {
+			_ = session.ptmx.Close()
+		}
+		if session.stdin != nil {
+			_ = session.stdin.Close()
+		}
+		if session.stdout != nil {
+			_ = session.stdout.Close()
+		}
 		if session.cmd.Process != nil {
 			_ = session.cmd.Process.Kill()
 		}
@@ -299,11 +309,7 @@ func startShellBridge(ctx context.Context, cancel context.CancelCauseFunc, clien
 		switch req.GetType() {
 		case "open":
 			shellCmd := exec.Command(defaultShell())
-			size := &pty.Winsize{
-				Cols: uint16(maxInt32(req.GetCols(), 80)),
-				Rows: uint16(maxInt32(req.GetRows(), 24)),
-			}
-			ptmx, err := pty.StartWithSize(shellCmd, size)
+			session, err := openShellSession(shellCmd, req.GetCols(), req.GetRows())
 			if err != nil {
 				_ = sendEvent(&pb.AgentShellEvent{
 					Type:      "open_error",
@@ -313,8 +319,6 @@ func startShellBridge(ctx context.Context, cancel context.CancelCauseFunc, clien
 				})
 				continue
 			}
-
-			session := &shellSession{cmd: shellCmd, ptmx: ptmx}
 			sessionsMu.Lock()
 			sessions[req.GetSessionId()] = session
 			sessionsMu.Unlock()
@@ -329,8 +333,9 @@ func startShellBridge(ctx context.Context, cancel context.CancelCauseFunc, clien
 				defer closeSession(sessionID, "shell closed")
 
 				buf := make([]byte, 1024)
+				reader := shellSessionReader(session)
 				for {
-					n, err := session.ptmx.Read(buf)
+					n, err := reader.Read(buf)
 					if n > 0 {
 						if sendErr := sendEvent(&pb.AgentShellEvent{
 							Type:      "output",
@@ -362,13 +367,17 @@ func startShellBridge(ctx context.Context, cancel context.CancelCauseFunc, clien
 			session, ok := sessions[req.GetSessionId()]
 			sessionsMu.Unlock()
 			if ok {
-				_, _ = session.ptmx.Write([]byte(req.GetData()))
+				inputData := req.GetData()
+				if runtime.GOOS == "windows" && session.ptmx == nil {
+					inputData = normalizeWindowsShellInput(inputData)
+				}
+				_, _ = shellSessionWriter(session).Write([]byte(inputData))
 			}
 		case "resize":
 			sessionsMu.Lock()
 			session, ok := sessions[req.GetSessionId()]
 			sessionsMu.Unlock()
-			if ok {
+			if ok && session.ptmx != nil {
 				_ = pty.Setsize(session.ptmx, &pty.Winsize{
 					Cols: uint16(maxInt32(req.GetCols(), 80)),
 					Rows: uint16(maxInt32(req.GetRows(), 24)),
@@ -752,6 +761,61 @@ func resolveUploadTargetPath(targetPath, sourceName string) (string, error) {
 		return filepath.Join(targetPath, name), nil
 	}
 	return targetPath, nil
+}
+
+func openShellSession(cmd *exec.Cmd, cols, rows int32) (*shellSession, error) {
+	if runtime.GOOS == "windows" {
+		stdout, err := cmd.StdoutPipe()
+		if err != nil {
+			return nil, err
+		}
+		cmd.Stderr = cmd.Stdout
+		stdin, err := cmd.StdinPipe()
+		if err != nil {
+			return nil, err
+		}
+		if err := cmd.Start(); err != nil {
+			_ = stdin.Close()
+			_ = stdout.Close()
+			return nil, err
+		}
+		return &shellSession{
+			cmd:    cmd,
+			stdin:  stdin,
+			stdout: stdout,
+		}, nil
+	}
+
+	size := &pty.Winsize{
+		Cols: uint16(maxInt32(cols, 80)),
+		Rows: uint16(maxInt32(rows, 24)),
+	}
+	ptmx, err := pty.StartWithSize(cmd, size)
+	if err != nil {
+		return nil, err
+	}
+	return &shellSession{cmd: cmd, ptmx: ptmx}, nil
+}
+
+func shellSessionReader(session *shellSession) io.Reader {
+	if session.ptmx != nil {
+		return session.ptmx
+	}
+	return session.stdout
+}
+
+func shellSessionWriter(session *shellSession) io.Writer {
+	if session.ptmx != nil {
+		return session.ptmx
+	}
+	return session.stdin
+}
+
+func normalizeWindowsShellInput(s string) string {
+	s = strings.ReplaceAll(s, "\r\n", "\n")
+	s = strings.ReplaceAll(s, "\r", "\n")
+	s = strings.ReplaceAll(s, "\n", "\r\n")
+	return s
 }
 
 func defaultShell() string {

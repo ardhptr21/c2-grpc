@@ -98,6 +98,8 @@ type operatorModel struct {
 	shellOutput           string
 	shellReady            bool
 	shellInputBuffer      string
+	shellPendingEcho      string
+	shellSkipEchoNewline  bool
 	fileDownloads         map[string]*activeDownload
 	width                 int
 	height                int
@@ -161,7 +163,7 @@ func newOperatorModel() operatorModel {
 	input.Prompt = "cmd> "
 
 	fileInput := textinput.New()
-	fileInput.Placeholder = "upload <local> <remote> or download <remote> <local>"
+	fileInput.Placeholder = `upload "/local path/file" "/remote path/" or download '/remote path/file' "./local dir/"`
 	fileInput.Focus()
 	fileInput.CharLimit = 512
 	fileInput.Prompt = "file> "
@@ -241,6 +243,8 @@ func (m operatorModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.shellOutput = ""
 		m.shellReady = false
 		m.shellInputBuffer = ""
+		m.shellPendingEcho = ""
+		m.shellSkipEchoNewline = false
 		m.fileLog = ""
 		m.fileViewport.SetContent("No file transfer activity yet.")
 		m.closeDownloadFiles()
@@ -593,7 +597,7 @@ func (m operatorModel) renderFiles() string {
 	footer := panelStyle.Width(dims.availableWidth).Render(
 		"Selected: " + m.selectedAgentLabel() + "\n" +
 			m.fileInput.View() + "\n" +
-			mutedStyle.Render("Use `upload <local> <remote>` or `download <remote> <local>`. F1 Live, F2 History, F3 Shell, F4 Files. PgUp/PgDn, Home/End, Ctrl+U/Ctrl+D scroll log.") + "\n" +
+			mutedStyle.Render("Use `upload <local> <remote>` or `download <remote> <local>`. Quote paths with spaces using '...' or \"...\". F1 Live, F2 History, F3 Shell, F4 Files. PgUp/PgDn, Home/End, Ctrl+U/Ctrl+D scroll log.") + "\n" +
 			m.status,
 	)
 
@@ -1017,6 +1021,7 @@ func sanitizeShellOutput(s string) string {
 
 func (m *operatorModel) appendShellOutput(chunk string) {
 	chunk = sanitizeShellOutput(chunk)
+	chunk = m.consumePendingShellEcho(chunk)
 	if chunk == "" {
 		return
 	}
@@ -1033,6 +1038,45 @@ func (m *operatorModel) appendShellOutput(chunk string) {
 		}
 	}
 	m.shellOutput = string(out)
+}
+
+func (m *operatorModel) consumePendingShellEcho(chunk string) string {
+	if chunk == "" {
+		return chunk
+	}
+
+	runes := []rune(chunk)
+	for len(runes) > 0 {
+		if m.shellPendingEcho != "" {
+			pending := []rune(m.shellPendingEcho)
+			if runes[0] == pending[0] {
+				runes = runes[1:]
+				m.shellPendingEcho = string(pending[1:])
+				if m.shellPendingEcho == "" {
+					m.shellSkipEchoNewline = true
+				}
+				continue
+			}
+			if idx := strings.Index(string(runes), m.shellPendingEcho); idx >= 0 {
+				trimmed := string(runes[:idx]) + string(runes[idx+len(m.shellPendingEcho):])
+				runes = []rune(trimmed)
+				m.shellPendingEcho = ""
+				m.shellSkipEchoNewline = true
+				continue
+			}
+			m.shellPendingEcho = ""
+		}
+		if m.shellSkipEchoNewline {
+			if runes[0] == '\n' {
+				runes = runes[1:]
+			}
+			m.shellSkipEchoNewline = false
+			continue
+		}
+		break
+	}
+
+	return string(runes)
 }
 
 func (m *operatorModel) appendEvent(event *pb.OperatorEvent) {
@@ -1164,6 +1208,8 @@ func (m *operatorModel) applyShellEvent(event *pb.AgentShellEvent) {
 		m.shellReady = true
 		m.shellOutput = ""
 		m.shellInputBuffer = ""
+		m.shellPendingEcho = ""
+		m.shellSkipEchoNewline = false
 		m.refreshShellViewport()
 		m.resizeShell()
 		m.status = fmt.Sprintf("Shell connected to agent:%s", shortAgentID(event.GetAgentId()))
@@ -1188,6 +1234,8 @@ func (m *operatorModel) applyShellEvent(event *pb.AgentShellEvent) {
 		m.shellReady = false
 		m.shellSessionID = ""
 		m.shellInputBuffer = ""
+		m.shellPendingEcho = ""
+		m.shellSkipEchoNewline = false
 		m.status = "shell closed"
 		if event.GetMessage() != "" {
 			m.status = "shell closed: " + event.GetMessage()
@@ -1230,11 +1278,15 @@ func (m *operatorModel) applyFileEvent(event *pb.AgentFileEvent) {
 }
 
 func (m *operatorModel) refreshShellViewport() {
-	if m.shellOutput == "" {
+	content := m.shellOutput
+	if m.shellInputBuffer != "" {
+		content += m.shellInputBuffer
+	}
+	if content == "" {
 		m.shellViewport.SetContent("No shell output yet.")
 		return
 	}
-	m.shellViewport.SetContent(m.shellOutput)
+	m.shellViewport.SetContent(content)
 	m.shellViewport.GotoBottom()
 }
 
@@ -1355,9 +1407,13 @@ func (m *operatorModel) handleFileCommand() (tea.Model, tea.Cmd) {
 		return m, nil
 	}
 
-	parts := strings.Fields(line)
+	parts, err := parseQuotedArgs(line)
+	if err != nil {
+		m.status = err.Error()
+		return m, nil
+	}
 	if len(parts) != 3 {
-		m.status = "Use: upload <local> <remote> or download <remote> <local>"
+		m.status = "Use: upload <local> <remote> or download <remote> <local>. Quote paths with spaces."
 		return m, nil
 	}
 
@@ -1380,6 +1436,54 @@ func (m *operatorModel) handleFileCommand() (tea.Model, tea.Cmd) {
 
 	m.fileInput.SetValue("")
 	return m, nil
+}
+
+func parseQuotedArgs(s string) ([]string, error) {
+	var (
+		args    []string
+		current []rune
+		inQuote rune
+		escaped bool
+	)
+
+	flush := func() {
+		if len(current) == 0 {
+			return
+		}
+		args = append(args, string(current))
+		current = nil
+	}
+
+	for _, r := range s {
+		switch {
+		case escaped:
+			current = append(current, r)
+			escaped = false
+		case r == '\\':
+			escaped = true
+		case inQuote != 0:
+			if r == inQuote {
+				inQuote = 0
+			} else {
+				current = append(current, r)
+			}
+		case r == '\'' || r == '"':
+			inQuote = r
+		case unicode.IsSpace(r):
+			flush()
+		default:
+			current = append(current, r)
+		}
+	}
+
+	if escaped {
+		current = append(current, '\\')
+	}
+	if inQuote != 0 {
+		return nil, fmt.Errorf("unterminated quoted path")
+	}
+	flush()
+	return args, nil
 }
 
 func (m *operatorModel) uploadFile(agentID, localPath, remotePath string) error {
@@ -1489,41 +1593,52 @@ func (m *operatorModel) handleShellKey(msg tea.KeyMsg) {
 	switch msg.String() {
 	case "enter":
 		if strings.TrimSpace(m.shellInputBuffer) == "clear" {
-			m.sendShellInput("\x15")
 			m.shellOutput = ""
 			m.shellInputBuffer = ""
+			m.shellPendingEcho = ""
+			m.shellSkipEchoNewline = false
 			m.refreshShellViewport()
 			m.status = "Shell pane cleared."
 			return
 		}
-		m.sendShellInput("\r")
+		if m.shellInputBuffer != "" {
+			m.shellOutput += m.shellInputBuffer + "\n"
+		}
+		m.shellPendingEcho = m.shellInputBuffer
+		m.shellSkipEchoNewline = false
+		m.sendShellInput(m.shellInputBuffer + "\r")
 		m.shellInputBuffer = ""
+		m.refreshShellViewport()
 		return
 	case "backspace":
-		m.sendShellInput("\x7f")
 		if len(m.shellInputBuffer) > 0 {
 			runes := []rune(m.shellInputBuffer)
 			m.shellInputBuffer = string(runes[:len(runes)-1])
 		}
+		m.refreshShellViewport()
 		return
 	case "delete":
-		m.sendShellInput("\x7f")
 		if len(m.shellInputBuffer) > 0 {
 			runes := []rune(m.shellInputBuffer)
 			m.shellInputBuffer = string(runes[:len(runes)-1])
 		}
+		m.refreshShellViewport()
 		return
 	case "ctrl+u":
-		m.sendShellInput("\x15")
 		m.shellInputBuffer = ""
+		m.refreshShellViewport()
 		return
 	case "ctrl+w":
-		m.sendShellInput("\x17")
 		m.shellInputBuffer = trimLastShellWord(m.shellInputBuffer)
+		m.refreshShellViewport()
 		return
 	case "ctrl+l":
-		m.sendShellInput("\x0c")
+		m.shellOutput = ""
+		m.refreshShellViewport()
 		m.shellInputBuffer = ""
+		m.shellPendingEcho = ""
+		m.shellSkipEchoNewline = false
+		m.status = "Shell pane cleared."
 		return
 	case "ctrl+d":
 		m.sendShellInput("\x04")
@@ -1540,13 +1655,19 @@ func (m *operatorModel) handleShellKey(msg tea.KeyMsg) {
 	case "end":
 		m.shellViewport.GotoBottom()
 		return
+	case "tab":
+		m.shellInputBuffer += "\t"
+		m.refreshShellViewport()
+		return
 	}
 
+	if len(msg.Runes) > 0 {
+		m.shellInputBuffer += string(msg.Runes)
+		m.refreshShellViewport()
+		return
+	}
 	if input, ok := shellInputForKey(msg); ok {
 		m.sendShellInput(input)
-		if len(msg.Runes) > 0 {
-			m.shellInputBuffer += string(msg.Runes)
-		}
 	}
 }
 
