@@ -921,3 +921,196 @@ var ShellService_ServiceDesc = grpc.ServiceDesc{
 	},
 	Metadata: "c2.proto",
 }
+
+const (
+	FileService_AgentTransfer_FullMethodName    = "/c2grpc.FileService/AgentTransfer"
+	FileService_OperatorTransfer_FullMethodName = "/c2grpc.FileService/OperatorTransfer"
+)
+
+// FileServiceClient is the client API for FileService service.
+//
+// For semantics around ctx use and closing/ending streaming RPCs, please refer to https://pkg.go.dev/google.golang.org/grpc/?tab=doc#ClientConn.NewStream.
+type FileServiceClient interface {
+	AgentTransfer(ctx context.Context, opts ...grpc.CallOption) (FileService_AgentTransferClient, error)
+	OperatorTransfer(ctx context.Context, opts ...grpc.CallOption) (FileService_OperatorTransferClient, error)
+}
+
+type fileServiceClient struct {
+	cc grpc.ClientConnInterface
+}
+
+func NewFileServiceClient(cc grpc.ClientConnInterface) FileServiceClient {
+	return &fileServiceClient{cc}
+}
+
+func (c *fileServiceClient) AgentTransfer(ctx context.Context, opts ...grpc.CallOption) (FileService_AgentTransferClient, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	stream, err := c.cc.NewStream(ctx, &FileService_ServiceDesc.Streams[0], FileService_AgentTransfer_FullMethodName, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	x := &fileServiceAgentTransferClient{ClientStream: stream}
+	return x, nil
+}
+
+type FileService_AgentTransferClient interface {
+	Send(*AgentFileEvent) error
+	Recv() (*OperatorFileRequest, error)
+	grpc.ClientStream
+}
+
+type fileServiceAgentTransferClient struct {
+	grpc.ClientStream
+}
+
+func (x *fileServiceAgentTransferClient) Send(m *AgentFileEvent) error {
+	return x.ClientStream.SendMsg(m)
+}
+
+func (x *fileServiceAgentTransferClient) Recv() (*OperatorFileRequest, error) {
+	m := new(OperatorFileRequest)
+	if err := x.ClientStream.RecvMsg(m); err != nil {
+		return nil, err
+	}
+	return m, nil
+}
+
+func (c *fileServiceClient) OperatorTransfer(ctx context.Context, opts ...grpc.CallOption) (FileService_OperatorTransferClient, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	stream, err := c.cc.NewStream(ctx, &FileService_ServiceDesc.Streams[1], FileService_OperatorTransfer_FullMethodName, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	x := &fileServiceOperatorTransferClient{ClientStream: stream}
+	return x, nil
+}
+
+type FileService_OperatorTransferClient interface {
+	Send(*OperatorFileRequest) error
+	Recv() (*AgentFileEvent, error)
+	grpc.ClientStream
+}
+
+type fileServiceOperatorTransferClient struct {
+	grpc.ClientStream
+}
+
+func (x *fileServiceOperatorTransferClient) Send(m *OperatorFileRequest) error {
+	return x.ClientStream.SendMsg(m)
+}
+
+func (x *fileServiceOperatorTransferClient) Recv() (*AgentFileEvent, error) {
+	m := new(AgentFileEvent)
+	if err := x.ClientStream.RecvMsg(m); err != nil {
+		return nil, err
+	}
+	return m, nil
+}
+
+// FileServiceServer is the server API for FileService service.
+// All implementations must embed UnimplementedFileServiceServer
+// for forward compatibility
+type FileServiceServer interface {
+	AgentTransfer(FileService_AgentTransferServer) error
+	OperatorTransfer(FileService_OperatorTransferServer) error
+	mustEmbedUnimplementedFileServiceServer()
+}
+
+// UnimplementedFileServiceServer must be embedded to have forward compatible implementations.
+type UnimplementedFileServiceServer struct {
+}
+
+func (UnimplementedFileServiceServer) AgentTransfer(FileService_AgentTransferServer) error {
+	return status.Errorf(codes.Unimplemented, "method AgentTransfer not implemented")
+}
+func (UnimplementedFileServiceServer) OperatorTransfer(FileService_OperatorTransferServer) error {
+	return status.Errorf(codes.Unimplemented, "method OperatorTransfer not implemented")
+}
+func (UnimplementedFileServiceServer) mustEmbedUnimplementedFileServiceServer() {}
+
+// UnsafeFileServiceServer may be embedded to opt out of forward compatibility for this service.
+// Use of this interface is not recommended, as added methods to FileServiceServer will
+// result in compilation errors.
+type UnsafeFileServiceServer interface {
+	mustEmbedUnimplementedFileServiceServer()
+}
+
+func RegisterFileServiceServer(s grpc.ServiceRegistrar, srv FileServiceServer) {
+	s.RegisterService(&FileService_ServiceDesc, srv)
+}
+
+func _FileService_AgentTransfer_Handler(srv interface{}, stream grpc.ServerStream) error {
+	return srv.(FileServiceServer).AgentTransfer(&fileServiceAgentTransferServer{ServerStream: stream})
+}
+
+type FileService_AgentTransferServer interface {
+	Send(*OperatorFileRequest) error
+	Recv() (*AgentFileEvent, error)
+	grpc.ServerStream
+}
+
+type fileServiceAgentTransferServer struct {
+	grpc.ServerStream
+}
+
+func (x *fileServiceAgentTransferServer) Send(m *OperatorFileRequest) error {
+	return x.ServerStream.SendMsg(m)
+}
+
+func (x *fileServiceAgentTransferServer) Recv() (*AgentFileEvent, error) {
+	m := new(AgentFileEvent)
+	if err := x.ServerStream.RecvMsg(m); err != nil {
+		return nil, err
+	}
+	return m, nil
+}
+
+func _FileService_OperatorTransfer_Handler(srv interface{}, stream grpc.ServerStream) error {
+	return srv.(FileServiceServer).OperatorTransfer(&fileServiceOperatorTransferServer{ServerStream: stream})
+}
+
+type FileService_OperatorTransferServer interface {
+	Send(*AgentFileEvent) error
+	Recv() (*OperatorFileRequest, error)
+	grpc.ServerStream
+}
+
+type fileServiceOperatorTransferServer struct {
+	grpc.ServerStream
+}
+
+func (x *fileServiceOperatorTransferServer) Send(m *AgentFileEvent) error {
+	return x.ServerStream.SendMsg(m)
+}
+
+func (x *fileServiceOperatorTransferServer) Recv() (*OperatorFileRequest, error) {
+	m := new(OperatorFileRequest)
+	if err := x.ServerStream.RecvMsg(m); err != nil {
+		return nil, err
+	}
+	return m, nil
+}
+
+// FileService_ServiceDesc is the grpc.ServiceDesc for FileService service.
+// It's only intended for direct use with grpc.RegisterService,
+// and not to be introspected or modified (even as a copy)
+var FileService_ServiceDesc = grpc.ServiceDesc{
+	ServiceName: "c2grpc.FileService",
+	HandlerType: (*FileServiceServer)(nil),
+	Methods:     []grpc.MethodDesc{},
+	Streams: []grpc.StreamDesc{
+		{
+			StreamName:    "AgentTransfer",
+			Handler:       _FileService_AgentTransfer_Handler,
+			ServerStreams: true,
+			ClientStreams: true,
+		},
+		{
+			StreamName:    "OperatorTransfer",
+			Handler:       _FileService_OperatorTransfer_Handler,
+			ServerStreams: true,
+			ClientStreams: true,
+		},
+	},
+	Metadata: "c2.proto",
+}

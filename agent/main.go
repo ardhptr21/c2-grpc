@@ -43,6 +43,11 @@ type shellSession struct {
 	ptmx *os.File
 }
 
+type uploadTarget struct {
+	file *os.File
+	path string
+}
+
 var errAgentAlreadyRegistered = errors.New("agent already registered")
 
 func main() {
@@ -118,6 +123,7 @@ func runAgentSession(ctx context.Context, serverAddr, hostname, machineID string
 	taskClient := pb.NewTaskServiceClient(conn)
 	outputServiceClient := pb.NewOutputServiceClient(conn)
 	shellClient := pb.NewShellServiceClient(conn)
+	fileClient := pb.NewFileServiceClient(conn)
 
 	registerCtx, cancelRegister := context.WithTimeout(ctx, 5*time.Second)
 	defer cancelRegister()
@@ -155,6 +161,7 @@ func runAgentSession(ctx context.Context, serverAddr, hostname, machineID string
 	go startHeartbeat(sessionCtx, cancelSession, heartbeatClient, reg.GetAgentId())
 	go startTaskListener(sessionCtx, cancelSession, taskClient, reg.GetAgentId())
 	go startShellBridge(sessionCtx, cancelSession, shellClient, reg.GetAgentId())
+	go startFileBridge(sessionCtx, cancelSession, fileClient, reg.GetAgentId())
 
 	<-sessionCtx.Done()
 	cause := context.Cause(sessionCtx)
@@ -373,6 +380,208 @@ func startShellBridge(ctx context.Context, cancel context.CancelCauseFunc, clien
 	}
 }
 
+func startFileBridge(ctx context.Context, cancel context.CancelCauseFunc, client pb.FileServiceClient, agentID string) {
+	stream, err := client.AgentTransfer(ctx)
+	if err != nil {
+		cancel(fmt.Errorf("server connection lost: file stream error: %w", err))
+		return
+	}
+
+	sendMu := &sync.Mutex{}
+	sendEvent := func(event *pb.AgentFileEvent) error {
+		sendMu.Lock()
+		defer sendMu.Unlock()
+		return stream.Send(event)
+	}
+
+	if err := sendEvent(&pb.AgentFileEvent{
+		Type:    "register",
+		AgentId: agentID,
+	}); err != nil {
+		cancel(fmt.Errorf("server connection lost: file register error: %w", err))
+		return
+	}
+
+	uploads := make(map[string]*uploadTarget)
+	var uploadsMu sync.Mutex
+
+	closeUpload := func(transferID string) {
+		uploadsMu.Lock()
+		target := uploads[transferID]
+		delete(uploads, transferID)
+		uploadsMu.Unlock()
+		if target != nil && target.file != nil {
+			_ = target.file.Close()
+		}
+	}
+
+	defer func() {
+		uploadsMu.Lock()
+		ids := make([]string, 0, len(uploads))
+		for transferID := range uploads {
+			ids = append(ids, transferID)
+		}
+		uploadsMu.Unlock()
+		for _, transferID := range ids {
+			closeUpload(transferID)
+		}
+	}()
+
+	for {
+		req, err := stream.Recv()
+		if err == io.EOF || ctx.Err() != nil {
+			return
+		}
+		if err != nil {
+			cancel(fmt.Errorf("server connection lost: file recv error: %w", err))
+			return
+		}
+
+		switch req.GetType() {
+		case "upload_start":
+			if req.GetTransferId() == "" || req.GetPath() == "" {
+				_ = sendEvent(&pb.AgentFileEvent{
+					Type:       "error",
+					TransferId: req.GetTransferId(),
+					AgentId:    agentID,
+					Path:       req.GetPath(),
+					Message:    "transfer_id and path are required",
+				})
+				continue
+			}
+			targetPath, err := resolveUploadTargetPath(req.GetPath(), req.GetMessage())
+			if err != nil {
+				_ = sendEvent(&pb.AgentFileEvent{
+					Type:       "error",
+					TransferId: req.GetTransferId(),
+					AgentId:    agentID,
+					Path:       req.GetPath(),
+					Message:    err.Error(),
+				})
+				continue
+			}
+			if err := os.MkdirAll(filepath.Dir(targetPath), 0o755); err != nil {
+				_ = sendEvent(&pb.AgentFileEvent{
+					Type:       "error",
+					TransferId: req.GetTransferId(),
+					AgentId:    agentID,
+					Path:       targetPath,
+					Message:    err.Error(),
+				})
+				continue
+			}
+			f, err := os.Create(targetPath)
+			if err != nil {
+				_ = sendEvent(&pb.AgentFileEvent{
+					Type:       "error",
+					TransferId: req.GetTransferId(),
+					AgentId:    agentID,
+					Path:       targetPath,
+					Message:    err.Error(),
+				})
+				continue
+			}
+			uploadsMu.Lock()
+			uploads[req.GetTransferId()] = &uploadTarget{file: f, path: targetPath}
+			uploadsMu.Unlock()
+		case "upload_chunk":
+			uploadsMu.Lock()
+			target := uploads[req.GetTransferId()]
+			uploadsMu.Unlock()
+			if target == nil || target.file == nil {
+				_ = sendEvent(&pb.AgentFileEvent{
+					Type:       "error",
+					TransferId: req.GetTransferId(),
+					AgentId:    agentID,
+					Path:       req.GetPath(),
+					Message:    "upload not initialized",
+				})
+				continue
+			}
+			if _, err := target.file.Write(req.GetData()); err != nil {
+				closeUpload(req.GetTransferId())
+				_ = sendEvent(&pb.AgentFileEvent{
+					Type:       "error",
+					TransferId: req.GetTransferId(),
+					AgentId:    agentID,
+					Path:       target.path,
+					Message:    err.Error(),
+				})
+			}
+		case "upload_end":
+			uploadsMu.Lock()
+			target := uploads[req.GetTransferId()]
+			uploadsMu.Unlock()
+			closeUpload(req.GetTransferId())
+			finalPath := req.GetPath()
+			if target != nil {
+				finalPath = target.path
+			}
+			_ = sendEvent(&pb.AgentFileEvent{
+				Type:       "upload_done",
+				TransferId: req.GetTransferId(),
+				AgentId:    agentID,
+				Path:       finalPath,
+				Message:    "upload completed",
+			})
+		case "download":
+			go func(req *pb.OperatorFileRequest) {
+				f, err := os.Open(req.GetPath())
+				if err != nil {
+					_ = sendEvent(&pb.AgentFileEvent{
+						Type:       "error",
+						TransferId: req.GetTransferId(),
+						AgentId:    agentID,
+						Path:       req.GetPath(),
+						Message:    err.Error(),
+					})
+					return
+				}
+				defer f.Close()
+
+				buf := make([]byte, 32*1024)
+				for {
+					n, err := f.Read(buf)
+					if n > 0 {
+						if sendErr := sendEvent(&pb.AgentFileEvent{
+							Type:       "download_chunk",
+							TransferId: req.GetTransferId(),
+							AgentId:    agentID,
+							Path:       req.GetPath(),
+							Data:       append([]byte(nil), buf[:n]...),
+						}); sendErr != nil {
+							return
+						}
+					}
+					if err == io.EOF {
+						break
+					}
+					if err != nil {
+						_ = sendEvent(&pb.AgentFileEvent{
+							Type:       "error",
+							TransferId: req.GetTransferId(),
+							AgentId:    agentID,
+							Path:       req.GetPath(),
+							Message:    err.Error(),
+						})
+						return
+					}
+				}
+
+				_ = sendEvent(&pb.AgentFileEvent{
+					Type:       "download_done",
+					TransferId: req.GetTransferId(),
+					AgentId:    agentID,
+					Path:       req.GetPath(),
+					Message:    "download completed",
+				})
+			}(req)
+		case "cancel":
+			closeUpload(req.GetTransferId())
+		}
+	}
+}
+
 func executeTask(task *pb.Task) {
 	command := task.GetCommand()
 	args := task.GetArgs()
@@ -516,6 +725,33 @@ func machineIDPath() (string, error) {
 		return "", err
 	}
 	return filepath.Join(homeDir, ".c2-grpc-agent-id"), nil
+}
+
+func resolveUploadTargetPath(targetPath, sourceName string) (string, error) {
+	targetPath = strings.TrimSpace(targetPath)
+	if targetPath == "" {
+		return "", fmt.Errorf("target path is required")
+	}
+
+	info, err := os.Stat(targetPath)
+	if err == nil && info.IsDir() {
+		name := filepath.Base(strings.TrimSpace(sourceName))
+		if name == "." || name == string(filepath.Separator) || name == "" {
+			return "", fmt.Errorf("source filename is required for directory upload")
+		}
+		return filepath.Join(targetPath, name), nil
+	}
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return "", err
+	}
+	if strings.HasSuffix(targetPath, string(filepath.Separator)) {
+		name := filepath.Base(strings.TrimSpace(sourceName))
+		if name == "." || name == string(filepath.Separator) || name == "" {
+			return "", fmt.Errorf("source filename is required for directory upload")
+		}
+		return filepath.Join(targetPath, name), nil
+	}
+	return targetPath, nil
 }
 
 func defaultShell() string {

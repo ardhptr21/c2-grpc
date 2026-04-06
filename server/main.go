@@ -64,6 +64,21 @@ type shellSession struct {
 	OperatorID string
 }
 
+type agentFileConn struct {
+	stream pb.FileService_AgentTransferServer
+	mu     sync.Mutex
+}
+
+type operatorFileConn struct {
+	stream pb.FileService_OperatorTransferServer
+	mu     sync.Mutex
+}
+
+type fileTransfer struct {
+	AgentID    string
+	OperatorID string
+}
+
 var (
 	agentsMu sync.RWMutex
 	agents   = make(map[string]*Agent)
@@ -91,6 +106,15 @@ var (
 
 	shellSessionsMu sync.Mutex
 	shellSessions   = make(map[string]shellSession)
+
+	agentFilesMu sync.Mutex
+	agentFiles   = make(map[string]*agentFileConn)
+
+	operatorFilesMu sync.Mutex
+	operatorFiles   = make(map[string]*operatorFileConn)
+
+	fileTransfersMu sync.Mutex
+	fileTransfers   = make(map[string]fileTransfer)
 
 	mongoClient       *mongo.Client
 	historyCollection *mongo.Collection
@@ -122,6 +146,10 @@ type historyServer struct {
 
 type shellServer struct {
 	pb.UnimplementedShellServiceServer
+}
+
+type fileServer struct {
+	pb.UnimplementedFileServiceServer
 }
 
 func shortUUID(n int) string {
@@ -174,6 +202,18 @@ func removeAgent(agentID string) (string, bool) {
 		}
 	}
 	shellSessionsMu.Unlock()
+
+	agentFilesMu.Lock()
+	delete(agentFiles, agentID)
+	agentFilesMu.Unlock()
+
+	fileTransfersMu.Lock()
+	for transferID, transfer := range fileTransfers {
+		if transfer.AgentID == agentID {
+			delete(fileTransfers, transferID)
+		}
+	}
+	fileTransfersMu.Unlock()
 
 	return agent.Hostname, true
 }
@@ -228,6 +268,83 @@ func sendToOperatorShell(operatorID string, event *pb.AgentShellEvent) error {
 	conn.mu.Lock()
 	defer conn.mu.Unlock()
 	return conn.stream.Send(event)
+}
+
+func sendToAgentFile(agentID string, req *pb.OperatorFileRequest) error {
+	agentFilesMu.Lock()
+	conn, ok := agentFiles[agentID]
+	agentFilesMu.Unlock()
+	if !ok {
+		return status.Error(codes.NotFound, "agent file stream unavailable")
+	}
+
+	conn.mu.Lock()
+	defer conn.mu.Unlock()
+	return conn.stream.Send(req)
+}
+
+func sendToOperatorFile(operatorID string, event *pb.AgentFileEvent) error {
+	operatorFilesMu.Lock()
+	conn, ok := operatorFiles[operatorID]
+	operatorFilesMu.Unlock()
+	if !ok {
+		return status.Error(codes.NotFound, "operator file stream unavailable")
+	}
+
+	conn.mu.Lock()
+	defer conn.mu.Unlock()
+	return conn.stream.Send(event)
+}
+
+func closeFileTransfersForOperator(operatorID string) {
+	var requests []*pb.OperatorFileRequest
+
+	fileTransfersMu.Lock()
+	for transferID, transfer := range fileTransfers {
+		if transfer.OperatorID == operatorID {
+			requests = append(requests, &pb.OperatorFileRequest{
+				Type:       "cancel",
+				TransferId: transferID,
+				AgentId:    transfer.AgentID,
+			})
+			delete(fileTransfers, transferID)
+		}
+	}
+	fileTransfersMu.Unlock()
+
+	for _, req := range requests {
+		_ = sendToAgentFile(req.GetAgentId(), req)
+	}
+}
+
+func closeFileTransfersForAgent(agentID string) {
+	var notify []struct {
+		operatorID string
+		transferID string
+		remotePath string
+	}
+
+	fileTransfersMu.Lock()
+	for transferID, transfer := range fileTransfers {
+		if transfer.AgentID == agentID {
+			notify = append(notify, struct {
+				operatorID string
+				transferID string
+				remotePath string
+			}{operatorID: transfer.OperatorID, transferID: transferID})
+			delete(fileTransfers, transferID)
+		}
+	}
+	fileTransfersMu.Unlock()
+
+	for _, item := range notify {
+		_ = sendToOperatorFile(item.operatorID, &pb.AgentFileEvent{
+			Type:       "error",
+			TransferId: item.transferID,
+			AgentId:    agentID,
+			Message:    "agent file transfer disconnected",
+		})
+	}
 }
 
 func closeShellSessionsForOperator(operatorID string) {
@@ -845,6 +962,137 @@ func (s *shellServer) OperatorShell(stream pb.ShellService_OperatorShellServer) 
 	}
 }
 
+func (s *fileServer) AgentTransfer(stream pb.FileService_AgentTransferServer) error {
+	var agentID string
+
+	for {
+		event, err := stream.Recv()
+		if err == io.EOF {
+			if agentID != "" {
+				agentFilesMu.Lock()
+				delete(agentFiles, agentID)
+				agentFilesMu.Unlock()
+				closeFileTransfersForAgent(agentID)
+			}
+			return nil
+		}
+		if err != nil {
+			if agentID != "" {
+				agentFilesMu.Lock()
+				delete(agentFiles, agentID)
+				agentFilesMu.Unlock()
+				closeFileTransfersForAgent(agentID)
+			}
+			return err
+		}
+
+		if event.GetType() == "register" {
+			agentID = event.GetAgentId()
+			agentFilesMu.Lock()
+			agentFiles[agentID] = &agentFileConn{stream: stream}
+			agentFilesMu.Unlock()
+			continue
+		}
+
+		fileTransfersMu.Lock()
+		transfer, ok := fileTransfers[event.GetTransferId()]
+		fileTransfersMu.Unlock()
+		if !ok {
+			continue
+		}
+
+		_ = sendToOperatorFile(transfer.OperatorID, event)
+		switch event.GetType() {
+		case "upload_done", "download_done", "error":
+			fileTransfersMu.Lock()
+			delete(fileTransfers, event.GetTransferId())
+			fileTransfersMu.Unlock()
+		}
+	}
+}
+
+func (s *fileServer) OperatorTransfer(stream pb.FileService_OperatorTransferServer) error {
+	operatorID := shortUUID(8)
+
+	operatorFilesMu.Lock()
+	operatorFiles[operatorID] = &operatorFileConn{stream: stream}
+	operatorFilesMu.Unlock()
+	defer func() {
+		operatorFilesMu.Lock()
+		delete(operatorFiles, operatorID)
+		operatorFilesMu.Unlock()
+		closeFileTransfersForOperator(operatorID)
+	}()
+
+	for {
+		req, err := stream.Recv()
+		if err == io.EOF || stream.Context().Err() != nil {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+
+		switch req.GetType() {
+		case "upload_start", "download":
+			if req.GetAgentId() == "" || req.GetTransferId() == "" {
+				_ = sendToOperatorFile(operatorID, &pb.AgentFileEvent{
+					Type:       "error",
+					TransferId: req.GetTransferId(),
+					AgentId:    req.GetAgentId(),
+					Message:    "agent_id and transfer_id are required",
+				})
+				continue
+			}
+
+			fileTransfersMu.Lock()
+			fileTransfers[req.GetTransferId()] = fileTransfer{
+				AgentID:    req.GetAgentId(),
+				OperatorID: operatorID,
+			}
+			fileTransfersMu.Unlock()
+
+			if err := sendToAgentFile(req.GetAgentId(), req); err != nil {
+				fileTransfersMu.Lock()
+				delete(fileTransfers, req.GetTransferId())
+				fileTransfersMu.Unlock()
+				_ = sendToOperatorFile(operatorID, &pb.AgentFileEvent{
+					Type:       "error",
+					TransferId: req.GetTransferId(),
+					AgentId:    req.GetAgentId(),
+					Path:       req.GetPath(),
+					Message:    err.Error(),
+				})
+			}
+		case "upload_chunk", "upload_end", "cancel":
+			fileTransfersMu.Lock()
+			transfer, ok := fileTransfers[req.GetTransferId()]
+			fileTransfersMu.Unlock()
+			if !ok {
+				continue
+			}
+			req.AgentId = transfer.AgentID
+			if err := sendToAgentFile(transfer.AgentID, req); err != nil {
+				_ = sendToOperatorFile(operatorID, &pb.AgentFileEvent{
+					Type:       "error",
+					TransferId: req.GetTransferId(),
+					AgentId:    transfer.AgentID,
+					Path:       req.GetPath(),
+					Message:    err.Error(),
+				})
+				fileTransfersMu.Lock()
+				delete(fileTransfers, req.GetTransferId())
+				fileTransfersMu.Unlock()
+			}
+			if req.GetType() == "cancel" {
+				fileTransfersMu.Lock()
+				delete(fileTransfers, req.GetTransferId())
+				fileTransfersMu.Unlock()
+			}
+		}
+	}
+}
+
 func pushTaskToAgent(agentID string, task pb.Task) {
 	agentStreamsMu.Lock()
 	stream, ok := agentStreams[agentID]
@@ -897,6 +1145,7 @@ func main() {
 	pb.RegisterOperatorServiceServer(s, &operatorServer{})
 	pb.RegisterHistoryServiceServer(s, &historyServer{})
 	pb.RegisterShellServiceServer(s, &shellServer{})
+	pb.RegisterFileServiceServer(s, &fileServer{})
 
 	go startWatchdog()
 
