@@ -234,10 +234,6 @@ func (m operatorModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.agents = make(map[string]agentRow)
 		m.agentOrder = nil
 		m.selected = 0
-		m.historyEntries = nil
-		m.historySelected = 0
-		m.historyAgentID = ""
-		m.historyCache = make(map[string][]*pb.AgentHistoryEntry)
 		m.shellSessionID = ""
 		m.shellAgentID = ""
 		m.shellOutput = ""
@@ -249,11 +245,13 @@ func (m operatorModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.fileViewport.SetContent("No file transfer activity yet.")
 		m.closeDownloadFiles()
 		m.fileDownloads = make(map[string]*activeDownload)
-		m.activeTab = "live"
 		if msg.message != "" {
 			m.status = msg.message
 		} else {
 			m.status = "Disconnected from server. Reconnecting..."
+		}
+		if m.activeTab == "history" {
+			m.refreshHistoryViewports()
 		}
 		return m, waitForOperatorEvent(m.events)
 	case historyLoadedMsg:
@@ -311,8 +309,9 @@ func (m operatorModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			return m, nil
 		case "f4":
-			m.activeTab = "files"
-			m.status = "File transfer tab ready."
+			if cmd := m.activateFilesTab(); cmd != nil {
+				return m, cmd
+			}
 			return m, nil
 		}
 
@@ -623,6 +622,13 @@ func (m *operatorModel) applyEvent(event *pb.OperatorEvent) tea.Cmd {
 			Status:  status,
 		}
 		m.rebuildAgentOrder()
+	case "agent_cached":
+		m.agents[event.GetAgentId()] = agentRow{
+			ID:      event.GetAgentId(),
+			Summary: event.GetPayload(),
+			Status:  "OFFLINE",
+		}
+		m.rebuildAgentOrder()
 	case "agent_dead":
 		row := m.agents[event.GetAgentId()]
 		row.ID = event.GetAgentId()
@@ -650,15 +656,56 @@ func (m *operatorModel) applyEvent(event *pb.OperatorEvent) tea.Cmd {
 
 func (m *operatorModel) rebuildAgentOrder() {
 	m.agentOrder = m.agentOrder[:0]
+	seen := make(map[string]struct{})
 	for id := range m.agents {
 		m.agentOrder = append(m.agentOrder, id)
+		seen[id] = struct{}{}
 	}
-	sort.Strings(m.agentOrder)
+	for id, entries := range m.historyCache {
+		if len(entries) == 0 {
+			continue
+		}
+		if _, ok := seen[id]; ok {
+			continue
+		}
+		m.agentOrder = append(m.agentOrder, id)
+	}
+	sort.Slice(m.agentOrder, func(i, j int) bool {
+		leftStatus := m.agentStatusForID(m.agentOrder[i])
+		rightStatus := m.agentStatusForID(m.agentOrder[j])
+		leftRank := agentStatusRank(leftStatus)
+		rightRank := agentStatusRank(rightStatus)
+		if leftRank != rightRank {
+			return leftRank < rightRank
+		}
+		return m.agentOrder[i] < m.agentOrder[j]
+	})
 	if m.selected >= len(m.agentOrder) && len(m.agentOrder) > 0 {
 		m.selected = len(m.agentOrder) - 1
 	}
 	if len(m.agentOrder) == 0 {
 		m.selected = 0
+	}
+}
+
+func (m *operatorModel) agentStatusForID(agentID string) string {
+	agent, ok := m.agents[agentID]
+	if !ok {
+		return "OFFLINE"
+	}
+	return agent.Status
+}
+
+func agentStatusRank(status string) int {
+	switch status {
+	case "ALIVE", "IDLE", "BUSY":
+		return 0
+	case "DEAD":
+		return 1
+	case "OFFLINE":
+		return 2
+	default:
+		return 3
 	}
 }
 
@@ -745,15 +792,22 @@ func (m operatorModel) renderFooter(width int) string {
 
 func (m operatorModel) renderAgents() string {
 	if len(m.agentOrder) == 0 {
-		return "Agents\n\nNo agents connected."
+		return "Agents\n\nNo agents connected.\nNo cached agents."
 	}
 
 	rows := make([]string, 0, len(m.agentOrder)+2)
 	rows = append(rows, "Agents", "")
 	for i, id := range m.agentOrder {
-		agent := m.agents[id]
+		agent, ok := m.agents[id]
+		if !ok {
+			agent = agentRow{
+				ID:      id,
+				Summary: "saved history available",
+				Status:  "OFFLINE",
+			}
+		}
 		row := fmt.Sprintf("%s  %s", shortAgentID(id), agent.Summary)
-		if agent.Status == "DEAD" {
+		if agent.Status == "DEAD" || agent.Status == "OFFLINE" {
 			row = deadRow.Render(row)
 		}
 		if i == m.selected {
@@ -967,6 +1021,8 @@ func formatEvent(event *pb.OperatorEvent) string {
 		return fmt.Sprintf("[!] agent:%s  %s", shortAgentID(event.GetAgentId()), event.GetPayload())
 	case "agent_removed":
 		return fmt.Sprintf("[-] agent:%s  %s", shortAgentID(event.GetAgentId()), event.GetPayload())
+	case "agent_cached":
+		return fmt.Sprintf("[.] agent:%s  %s", shortAgentID(event.GetAgentId()), event.GetPayload())
 	case "history_updated":
 		return ""
 	case "output":
@@ -1154,23 +1210,31 @@ func (m *operatorModel) refreshHistoryViewports() {
 }
 
 func (m *operatorModel) activateHistoryTab() tea.Cmd {
-	if m.historyClient == nil {
-		m.status = "History service unavailable."
-		return nil
-	}
+	m.activeTab = "history"
 	if len(m.agentOrder) == 0 {
-		m.status = "No agents connected."
+		if agentID, ok := m.cachedHistoryAgentID(); ok {
+			m.historyAgentID = agentID
+			m.historyEntries = cloneHistoryEntries(m.historyCache[agentID])
+			m.historySelected = 0
+			m.refreshHistoryViewports()
+			m.status = fmt.Sprintf("Showing saved history for offline agent:%s", shortAgentID(agentID))
+			return nil
+		}
+		m.status = "No saved history available."
 		return nil
 	}
 
 	agentID := m.agentOrder[m.selected]
-	m.activeTab = "history"
 	if cached, ok := m.historyCache[agentID]; ok {
 		m.historyAgentID = agentID
 		m.historyEntries = cloneHistoryEntries(cached)
 		m.historySelected = 0
 		m.refreshHistoryViewports()
 		m.status = fmt.Sprintf("Showing cached history for agent:%s", shortAgentID(agentID))
+		return nil
+	}
+	if m.historyClient == nil {
+		m.status = "History service unavailable."
 		return nil
 	}
 	m.status = fmt.Sprintf("Loading history for agent:%s...", agentID)
@@ -1198,6 +1262,33 @@ func (m *operatorModel) upsertHistoryEntry(agentID string, entry *pb.AgentHistor
 		updated = updated[:200]
 	}
 	m.historyCache[agentID] = updated
+	m.rebuildAgentOrder()
+}
+
+func (m *operatorModel) cachedHistoryAgentID() (string, bool) {
+	if m.historyAgentID != "" {
+		if entries, ok := m.historyCache[m.historyAgentID]; ok && len(entries) > 0 {
+			return m.historyAgentID, true
+		}
+	}
+
+	var (
+		bestAgentID string
+		bestTime    int64
+		found       bool
+	)
+	for agentID, entries := range m.historyCache {
+		if len(entries) == 0 {
+			continue
+		}
+		executedAt := entries[0].GetExecutedAt()
+		if !found || executedAt > bestTime {
+			bestAgentID = agentID
+			bestTime = executedAt
+			found = true
+		}
+	}
+	return bestAgentID, found
 }
 
 func (m *operatorModel) applyShellEvent(event *pb.AgentShellEvent) {
@@ -1339,6 +1430,26 @@ func (m *operatorModel) activateShellTab() tea.Cmd {
 	}); err != nil {
 		m.status = fmt.Sprintf("shell open send error: %v", err)
 	}
+	return nil
+}
+
+func (m *operatorModel) activateFilesTab() tea.Cmd {
+	if len(m.agentOrder) == 0 {
+		m.status = "No agent selected."
+		return nil
+	}
+	agentID := m.agentOrder[m.selected]
+	agent, ok := m.agents[agentID]
+	if !ok || agent.Status == "OFFLINE" || agent.Status == "DEAD" {
+		m.status = "Files tab requires a live selected agent."
+		return nil
+	}
+	if m.fileStream == nil {
+		m.status = "File service unavailable."
+		return nil
+	}
+	m.activeTab = "files"
+	m.status = fmt.Sprintf("File transfer tab ready for agent:%s", shortAgentID(agentID))
 	return nil
 }
 

