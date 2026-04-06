@@ -8,11 +8,13 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"os"
 	"os/exec"
 	"os/signal"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -44,10 +46,17 @@ type shellSession struct {
 var errAgentAlreadyRegistered = errors.New("agent already registered")
 
 func main() {
-	serverAddr := flag.String("server", "localhost:50051", "gRPC server address")
+	host := flag.String("host", "localhost", "gRPC server host")
+	port := flag.Int("port", 50051, "gRPC server port")
+	serverAddr := flag.String("server", "", "deprecated: gRPC server address")
 	logFile := flag.String("log-file", "", "optional log file path")
 	flag.BoolVar(&headlessMode, "headless", false, "run without interactive stdout output")
 	flag.Parse()
+
+	targetAddr := net.JoinHostPort(*host, strconv.Itoa(*port))
+	if strings.TrimSpace(*serverAddr) != "" {
+		targetAddr = *serverAddr
+	}
 
 	configureLogging(*logFile)
 
@@ -68,7 +77,7 @@ func main() {
 			return
 		}
 
-		err := runAgentSession(ctx, *serverAddr, hostname, machineID)
+		err := runAgentSession(ctx, targetAddr, hostname, machineID)
 		if ctx.Err() != nil {
 			return
 		}
@@ -80,7 +89,7 @@ func main() {
 			agentLog("[agent] %v", err)
 		}
 
-		agentLog("[agent] reconnecting to %s in 3s", *serverAddr)
+		agentLog("[agent] reconnecting to %s in 3s", targetAddr)
 		select {
 		case <-ctx.Done():
 			return

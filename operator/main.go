@@ -6,7 +6,9 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"net"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 	"unicode"
@@ -103,14 +105,21 @@ var (
 )
 
 func main() {
-	serverAddr := flag.String("server", "localhost:50051", "gRPC server address")
+	host := flag.String("host", "localhost", "gRPC server host")
+	port := flag.Int("port", 50051, "gRPC server port")
+	serverAddr := flag.String("server", "", "deprecated: gRPC server address")
 	flag.Parse()
+
+	targetAddr := net.JoinHostPort(*host, strconv.Itoa(*port))
+	if strings.TrimSpace(*serverAddr) != "" {
+		targetAddr = *serverAddr
+	}
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
 	m := newOperatorModel()
-	go maintainOperatorConnection(ctx, *serverAddr, m.events)
+	go maintainOperatorConnection(ctx, targetAddr, m.events)
 
 	p := tea.NewProgram(m, tea.WithAltScreen(), tea.WithMouseCellMotion())
 	if _, err := p.Run(); err != nil {
@@ -934,7 +943,9 @@ func (m *operatorModel) refreshHistoryViewports() {
 	rows := make([]string, 0, len(m.historyEntries)+2)
 	rows = append(rows, "History", "")
 	for i, entry := range m.historyEntries {
-		label := fmt.Sprintf("%s  %s", formatMillis(entry.GetExecutedAt()), renderCommand(entry))
+		timestamp := formatMillis(entry.GetExecutedAt())
+		commandWidth := maxInt(1, m.historyListViewport.Width-lipgloss.Width(timestamp)-2)
+		label := fmt.Sprintf("%s  %s", timestamp, trimToWidth(renderCommand(entry), commandWidth))
 		if i == m.historySelected {
 			label = activeRow.Render(label)
 		}
@@ -1235,6 +1246,24 @@ func renderCommand(entry *pb.AgentHistoryEntry) string {
 		return entry.GetCommand()
 	}
 	return entry.GetCommand() + " " + entry.GetArgs()
+}
+
+func trimToWidth(s string, width int) string {
+	if width <= 0 {
+		return ""
+	}
+	if lipgloss.Width(s) <= width {
+		return s
+	}
+	if width == 1 {
+		return "…"
+	}
+
+	runes := []rune(s)
+	for len(runes) > 0 && lipgloss.Width(string(runes)) > width-1 {
+		runes = runes[:len(runes)-1]
+	}
+	return string(runes) + "…"
 }
 
 func formatMillis(v int64) string {

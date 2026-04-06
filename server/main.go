@@ -3,10 +3,12 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"flag"
 	"fmt"
 	"io"
 	"log"
 	"net"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -860,6 +862,10 @@ func pushTaskToAgent(agentID string, task pb.Task) {
 }
 
 func main() {
+	host := flag.String("host", "0.0.0.0", "host interface to bind the gRPC server to")
+	port := flag.Int("port", 50051, "TCP port to bind the gRPC server to")
+	flag.Parse()
+
 	mongoCtx, cancelMongo := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancelMongo()
 
@@ -874,7 +880,8 @@ func main() {
 		_ = mongoClient.Disconnect(disconnectCtx)
 	}()
 
-	lis, err := net.Listen("tcp", ":50051")
+	listenAddr := net.JoinHostPort(*host, strconv.Itoa(*port))
+	lis, err := net.Listen("tcp", listenAddr)
 	if err != nil {
 		log.Fatalf("listen error: %v", err)
 	}
