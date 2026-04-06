@@ -585,6 +585,53 @@ func startFileBridge(ctx context.Context, cancel context.CancelCauseFunc, client
 					Message:    "download completed",
 				})
 			}(req)
+		case "list":
+			go func(req *pb.OperatorFileRequest) {
+				listPath := strings.TrimSpace(req.GetPath())
+				if listPath == "" {
+					listPath = "."
+				}
+
+				entries, err := os.ReadDir(listPath)
+				if err != nil {
+					_ = sendEvent(&pb.AgentFileEvent{
+						Type:       "error",
+						TransferId: req.GetTransferId(),
+						AgentId:    agentID,
+						Path:       listPath,
+						Message:    err.Error(),
+					})
+					return
+				}
+
+				for _, entry := range entries {
+					info, err := entry.Info()
+					if err != nil {
+						continue
+					}
+					fullPath := filepath.Join(listPath, entry.Name())
+					if sendErr := sendEvent(&pb.AgentFileEvent{
+						Type:       "list_entry",
+						TransferId: req.GetTransferId(),
+						AgentId:    agentID,
+						Path:       fullPath,
+						Message:    entry.Name(),
+						IsDir:      entry.IsDir(),
+						Size:       info.Size(),
+						ModifiedAt: info.ModTime().UnixMilli(),
+					}); sendErr != nil {
+						return
+					}
+				}
+
+				_ = sendEvent(&pb.AgentFileEvent{
+					Type:       "list_done",
+					TransferId: req.GetTransferId(),
+					AgentId:    agentID,
+					Path:       listPath,
+					Message:    "directory listed",
+				})
+			}(req)
 		case "cancel":
 			closeUpload(req.GetTransferId())
 		}

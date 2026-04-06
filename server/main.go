@@ -1134,7 +1134,7 @@ func (s *fileServer) AgentTransfer(stream pb.FileService_AgentTransferServer) er
 
 		_ = sendToOperatorFile(transfer.OperatorID, event)
 		switch event.GetType() {
-		case "upload_done", "download_done", "error":
+		case "upload_done", "download_done", "list_done", "error":
 			fileTransfersMu.Lock()
 			delete(fileTransfers, event.GetTransferId())
 			fileTransfersMu.Unlock()
@@ -1165,7 +1165,7 @@ func (s *fileServer) OperatorTransfer(stream pb.FileService_OperatorTransferServ
 		}
 
 		switch req.GetType() {
-		case "upload_start", "download":
+		case "upload_start", "download", "list":
 			if req.GetAgentId() == "" || req.GetTransferId() == "" {
 				_ = sendToOperatorFile(operatorID, &pb.AgentFileEvent{
 					Type:       "error",
