@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"strings"
 	"time"
 
@@ -12,6 +13,7 @@ import (
 	"go.mongodb.org/mongo-driver/bson"
 	"go.mongodb.org/mongo-driver/mongo/options"
 	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/peer"
 	"google.golang.org/grpc/status"
 )
 
@@ -28,10 +30,20 @@ func (s *agentServer) Register(ctx context.Context, req *pb.RegisterRequest) (*p
 		return nil, status.Error(codes.AlreadyExists, "agent already registered")
 	}
 
+	ip := req.GetIp()
+	if ip == "127.0.0.1" || ip == "" {
+		if p, ok := peer.FromContext(ctx); ok {
+			host, _, err := net.SplitHostPort(p.Addr.String())
+			if err == nil {
+				ip = host
+			}
+		}
+	}
+
 	agents[machineID] = &Agent{
 		Hostname: req.GetHostname(),
 		OS:       req.GetOs(),
-		IP:       req.GetIp(),
+		IP:       ip,
 		Status:   "ALIVE",
 		LastSeen: time.Now(),
 	}
@@ -46,7 +58,7 @@ func (s *agentServer) Register(ctx context.Context, req *pb.RegisterRequest) (*p
 	go broadcastToOperators(&pb.OperatorEvent{
 		Type:    "agent_joined",
 		AgentId: machineID,
-		Payload: agentRosterPayload(req.GetHostname(), req.GetIp(), "ALIVE"),
+		Payload: agentRosterPayload(req.GetHostname(), ip, "ALIVE"),
 	})
 
 	return &pb.RegisterResponse{

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"net"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -47,7 +48,7 @@ func runAgentSession(ctx context.Context, serverAddr, hostname, machineID string
 	reg, err := agentServiceClient.Register(registerCtx, &pb.RegisterRequest{
 		Hostname:  hostname,
 		Os:        runtime.GOOS,
-		Ip:        "127.0.0.1",
+		Ip:        getLocalIP(),
 		MachineId: machineID,
 	})
 	if err != nil {
@@ -176,4 +177,19 @@ func agentLog(format string, args ...any) {
 		return
 	}
 	fmt.Printf(format+"\n", args...)
+}
+
+func getLocalIP() string {
+	addrs, err := net.InterfaceAddrs()
+	if err != nil {
+		return "127.0.0.1"
+	}
+	for _, address := range addrs {
+		if ipnet, ok := address.(*net.IPNet); ok && !ipnet.IP.IsLoopback() {
+			if ipnet.IP.To4() != nil {
+				return ipnet.IP.String()
+			}
+		}
+	}
+	return "127.0.0.1"
 }
